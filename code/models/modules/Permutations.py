@@ -36,23 +36,23 @@ class InvertibleConv1x1(nn.Module):
         pixels = thops.pixels(input)
         dlogdet = torch.slogdet(self.weight)[1] * pixels
         if not reverse:
-            weight = self.weight.view(w_shape[0], w_shape[1], 1, 1)
+            base = self.weight
         else:
-            weight = torch.inverse(self.weight.double()).float() \
-                .view(w_shape[0], w_shape[1], 1, 1)
+            base = torch.inverse(self.weight.double()).float()
+        if input.dim() == 5:  # 3D conv case
+            weight = base.view(w_shape[0], w_shape[1], 1, 1, 1)
+        else:  # 2D fallback
+            weight = base.view(w_shape[0], w_shape[1], 1, 1)
         return weight, dlogdet
+
     def forward(self, input, logdet=None, reverse=False):
-        """
-        log-det = log|abs(|W|)| * pixels
-        """
+        """log-det = log|det(W)| * number_of_spatial_positions."""
         weight, dlogdet = self.get_weight(input, reverse)
-        if not reverse:
-            z = F.conv2d(input, weight)
-            if logdet is not None:
-                logdet = logdet + dlogdet
-            return z, logdet
+        if input.dim() == 5:
+            conv_op = F.conv3d
         else:
-            z = F.conv2d(input, weight)
-            if logdet is not None:
-                logdet = logdet - dlogdet
-            return z, logdet
+            conv_op = F.conv2d
+        z = conv_op(input, weight)
+        if logdet is not None:
+            logdet = logdet + ( -dlogdet if reverse else dlogdet )
+        return z, logdet

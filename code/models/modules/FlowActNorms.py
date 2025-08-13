@@ -139,3 +139,47 @@ class MaskedActNorm2d(ActNorm2d):
 
         return input, logdet
 
+
+class ActNorm3d(_ActNorm):
+    """Activation Normalization for 3D tensors (B, C, D, H, W)."""
+    def __init__(self, num_features, scale=1.):
+        super().__init__(num_features, scale)
+        # Override parameter shapes to include depth dimension placeholder
+        self.bias = nn.Parameter(torch.zeros(1, num_features, 1, 1, 1))
+        self.logs = nn.Parameter(torch.zeros(1, num_features, 1, 1, 1))
+
+    def _check_input_dim(self, input):
+        assert input.dim() == 5, f"ActNorm3d expected 5D input (B,C,D,H,W), got {input.shape}"
+        assert input.size(1) == self.num_features, (
+            f"Channels mismatch: expected {self.num_features}, got {input.size(1)}")
+
+    def initialize_parameters(self, input):
+        self._check_input_dim(input)
+        if not self.training:
+            return
+        if (self.bias != 0).any():
+            self.inited = True
+            return
+        assert input.device == self.bias.device
+        with torch.no_grad():
+            # reduce over batch and spatial dims (exclude channels)
+            bias = thops.mean(input.clone(), dim=[0, 2, 3, 4], keepdim=True) * -1.0
+            vars = thops.mean((input.clone() + bias) ** 2, dim=[0, 2, 3, 4], keepdim=True)
+            logs = torch.log(self.scale / (torch.sqrt(vars) + 1e-6))
+            self.bias.data.copy_(bias.data)
+            self.logs.data.copy_(logs.data)
+            self.inited = True
+
+
+class MaskedActNorm3d(ActNorm3d):
+    def __init__(self, num_features, scale=1.):
+        super().__init__(num_features, scale)
+
+    def forward(self, input, mask, logdet=None, reverse=False):
+        assert mask.dtype == torch.bool
+        output, logdet_out = super().forward(input, logdet, reverse)
+        input[mask] = output[mask]
+        if logdet is not None:
+            logdet[mask] = logdet_out[mask]
+        return input, logdet
+

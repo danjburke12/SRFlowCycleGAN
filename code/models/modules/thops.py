@@ -65,4 +65,8 @@ def cat_feature(tensor_a, tensor_b):
 
 
 def pixels(tensor):
-    return int(tensor.size(2) * tensor.size(3))
+    if tensor.dim() == 4:  # B,C,H,W
+        return int(tensor.size(2) * tensor.size(3))
+    if tensor.dim() == 5:  # B,C,D,H,W
+        return int(tensor.size(2) * tensor.size(3) * tensor.size(4))
+    raise ValueError(f"Unsupported tensor dim for pixels(): {tensor.shape}")

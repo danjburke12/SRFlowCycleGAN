@@ -20,6 +20,7 @@ from torch import nn as nn
 import models.modules
 import models.modules.Permutations
 from models.modules import flow, thops, FlowAffineCouplingsAblation
+from models.modules.FlowActNorms import ActNorm2d, ActNorm3d
 from utils.util import opt_get
 
 
@@ -55,7 +56,7 @@ class FlowStep(nn.Module):
         self.flow_coupling = flow_coupling
         self.image_injector = image_injector
 
-        self.norm_type = normOpt['type'] if normOpt else 'ActNorm2d'
+    self.norm_type = normOpt['type'] if normOpt else 'ActNorm3d'
         self.position = normOpt['position'] if normOpt else None
 
         self.in_shape = in_shape
@@ -63,7 +64,9 @@ class FlowStep(nn.Module):
         self.acOpt = acOpt
 
         # 1. actnorm
-        self.actnorm = models.modules.FlowActNorms.ActNorm2d(in_channels, actnorm_scale)
+    # Choose 3D ActNorm by default (inputs expected (B,C,D,H,W)); fall back to 2D if needed at runtime
+    self.actnorm3d = ActNorm3d(in_channels, actnorm_scale)
+    self.actnorm2d = ActNorm2d(in_channels, actnorm_scale)
 
         # 2. permute
         if flow_permutation == "invconv":
@@ -92,11 +95,13 @@ class FlowStep(nn.Module):
         # 1. actnorm
         if self.norm_type == "ConditionalActNormImageInjector":
             img_ft = getConditional(rrdbResults, self.position)
-            z, logdet = self.actnorm(z, img_ft=img_ft, logdet=logdet, reverse=False)
+            actnorm_module = self._select_actnorm(z)
+            z, logdet = actnorm_module(z, logdet=logdet, reverse=False)
         elif self.norm_type == "noNorm":
             pass
         else:
-            z, logdet = self.actnorm(z, logdet=logdet, reverse=False)
+            actnorm_module = self._select_actnorm(z)
+            z, logdet = actnorm_module(z, logdet=logdet, reverse=False)
 
         # 2. permute
         z, logdet = FlowStep.FlowPermutation[self.flow_permutation](
@@ -124,7 +129,8 @@ class FlowStep(nn.Module):
             self, z, logdet, True)
 
         # 3. actnorm
-        z, logdet = self.actnorm(z, logdet=logdet, reverse=True)
+    actnorm_module = self._select_actnorm(z)
+    z, logdet = actnorm_module(z, logdet=logdet, reverse=True)
 
         return z, logdet
 
@@ -135,3 +141,7 @@ class FlowStep(nn.Module):
         except:
             pass
         return need_features
+
+    def _select_actnorm(self, z):
+        # If 5D tensor -> 3D actnorm, else 2D
+        return self.actnorm3d if z.dim() == 5 else self.actnorm2d

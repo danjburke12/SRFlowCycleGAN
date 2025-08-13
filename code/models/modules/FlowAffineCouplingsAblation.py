@@ -18,7 +18,7 @@ import torch
 from torch import nn as nn
 
 from models.modules import thops
-from models.modules.flow import Conv2d, Conv2dZeros
+from models.modules.flow import Conv3d as ConvND, Conv3dZeros as ConvNDZeros
 from utils.util import opt_get
 
 
@@ -103,7 +103,9 @@ class CondAffineSeparatedAndCond(nn.Module):
         assert scale.shape[1] == z2.shape[1], (scale.shape[1], z1.shape[1], z2.shape[1])
 
     def get_logdet(self, scale):
-        return thops.sum(torch.log(scale), dim=[1, 2, 3])
+        # Sum over all spatial dims (works for 4D or 5D tensors)
+        dims = list(range(1, scale.dim()))  # exclude batch dim
+        return thops.sum(torch.log(scale), dim=dims)
 
     def feature_extract(self, z, f):
         h = f(z)
@@ -125,11 +127,14 @@ class CondAffineSeparatedAndCond(nn.Module):
         return z1, z2
 
     def F(self, in_channels, out_channels, hidden_channels, kernel_hidden=1, n_hidden_layers=1):
-        layers = [Conv2d(in_channels, hidden_channels), nn.ReLU(inplace=False)]
-
+        """Build small conditional subnet. Uses 3D convs (ConvND) which also work on 4D by treating depth=1 if provided.
+        """
+        layers = [ConvND(in_channels, hidden_channels)]
+        layers.append(nn.ReLU(inplace=False))
         for _ in range(n_hidden_layers):
-            layers.append(Conv2d(hidden_channels, hidden_channels, kernel_size=[kernel_hidden, kernel_hidden]))
+            # Build isotropic kernel for 3D; ConvND ignores extra dims if input 2D-shaped
+            k = [kernel_hidden] * 3
+            layers.append(ConvND(hidden_channels, hidden_channels, kernel_size=k))
             layers.append(nn.ReLU(inplace=False))
-        layers.append(Conv2dZeros(hidden_channels, out_channels))
-
+        layers.append(ConvNDZeros(hidden_channels, out_channels))
         return nn.Sequential(*layers)
