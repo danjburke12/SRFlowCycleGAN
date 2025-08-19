@@ -226,14 +226,24 @@ class SRFlowModel(BaseModel):
         if seed: torch.manual_seed(seed)
         if opt_get(self.opt, ['network_G', 'flow', 'split', 'enable']):
             C = self.netG.module.flowUpsamplerNet.C
-            H = int(self.opt['scale'] * lr_shape[2] // self.netG.module.flowUpsamplerNet.scaleH)
-            W = int(self.opt['scale'] * lr_shape[3] // self.netG.module.flowUpsamplerNet.scaleW)
-            z = torch.normal(mean=0, std=heat, size=(batch_size, C, H, W)) if heat > 0 else torch.zeros(
-                (batch_size, C, H, W))
+            
+            # Check if this is 3D (5D tensor) or 2D (4D tensor)
+            if len(lr_shape) == 5:  # 3D case: [batch, channel, depth, height, width]
+                D = int(self.opt['scale'] * lr_shape[2] // self.netG.module.flowUpsamplerNet.scaleH)
+                H = int(self.opt['scale'] * lr_shape[3] // self.netG.module.flowUpsamplerNet.scaleH) 
+                W = int(self.opt['scale'] * lr_shape[4] // self.netG.module.flowUpsamplerNet.scaleW)
+                z = torch.normal(mean=0, std=heat, size=(batch_size, C, D, H, W)) if heat > 0 else torch.zeros(
+                    (batch_size, C, D, H, W))
+            else:  # 2D case: [batch, channel, height, width]
+                H = int(self.opt['scale'] * lr_shape[2] // self.netG.module.flowUpsamplerNet.scaleH)
+                W = int(self.opt['scale'] * lr_shape[3] // self.netG.module.flowUpsamplerNet.scaleW)
+                z = torch.normal(mean=0, std=heat, size=(batch_size, C, H, W)) if heat > 0 else torch.zeros(
+                    (batch_size, C, H, W))
         else:
             L = opt_get(self.opt, ['network_G', 'flow', 'L']) or 3
             fac = 2 ** (L - 3)
             z_size = int(self.lr_size // (2 ** (L - 3)))
+            # This branch seems to be for 2D only, might need updating for 3D later
             z = torch.normal(mean=0, std=heat, size=(batch_size, 3 * 8 * 8 * fac * fac, z_size, z_size))
         return z
 

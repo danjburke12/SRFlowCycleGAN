@@ -27,7 +27,14 @@ class CondAffineSeparatedAndCond(nn.Module):
         super().__init__()
         self.need_features = True
         self.in_channels = in_channels
-        self.in_channels_rrdb = 320
+        
+        # Debug: print the full opt structure for flow
+        print(f"DEBUG opt flow keys: {opt.get('network_G', {}).get('flow', {}).keys()}")
+        print(f"DEBUG condAff section: {opt.get('network_G', {}).get('flow', {}).get('condAff', {})}")
+        
+        self.in_channels_rrdb = opt_get(opt, ['network_G', 'flow', 'condAff', 'in_channels_rrdb'], 320)
+        print(f"DEBUG opt_get result for in_channels_rrdb: {self.in_channels_rrdb}")
+        
         self.kernel_hidden = 1
         self.affine_eps = 0.0001
         self.n_hidden_layers = 1
@@ -47,6 +54,9 @@ class CondAffineSeparatedAndCond(nn.Module):
                               hidden_channels=self.hidden_channels,
                               kernel_hidden=self.kernel_hidden,
                               n_hidden_layers=self.n_hidden_layers)
+        
+        print(f"DEBUG CondAffineSeparatedAndCond: in_channels={self.in_channels}, channels_for_nn={self.channels_for_nn}, channels_for_co={self.channels_for_co}, in_channels_rrdb={self.in_channels_rrdb}")
+        print(f"DEBUG fAffine input channels: {self.channels_for_nn + self.in_channels_rrdb}")
 
         self.fFeatures = self.F(in_channels=self.in_channels_rrdb,
                                 out_channels=self.in_channels * 2,
@@ -114,7 +124,9 @@ class CondAffineSeparatedAndCond(nn.Module):
         return scale, shift
 
     def feature_extract_aff(self, z1, ft, f):
+        print(f"DEBUG feature_extract_aff: z1.shape={z1.shape}, ft.shape={ft.shape if ft is not None else None}")
         z = torch.cat([z1, ft], dim=1)
+        print(f"DEBUG feature_extract_aff: concatenated z.shape={z.shape}")
         h = f(z)
         shift, scale = thops.split_feature(h, "cross")
         scale = (torch.sigmoid(scale + 2.) + self.affine_eps)
@@ -129,6 +141,7 @@ class CondAffineSeparatedAndCond(nn.Module):
     def F(self, in_channels, out_channels, hidden_channels, kernel_hidden=1, n_hidden_layers=1):
         """Build small conditional subnet. Uses 3D convs (ConvND) which also work on 4D by treating depth=1 if provided.
         """
+        print(f"Building F network: in_channels={in_channels}, out_channels={out_channels}, hidden_channels={hidden_channels}")
         layers = [ConvND(in_channels, hidden_channels)]
         layers.append(nn.ReLU(inplace=False))
         for _ in range(n_hidden_layers):

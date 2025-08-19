@@ -51,8 +51,13 @@ def define_G(opt):
     which_model = opt_net['which_model_G']
 
     if which_model == 'RRDBNet':
-        netG = RRDBNet_arch.RRDBNet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'],
-                                    nf=opt_net['nf'], nb=opt_net['nb'], scale=opt['scale'], opt=opt)
+        use_iso3d = opt_net.get('isotropic3d', False)
+        if use_iso3d:
+            netG = RRDBNet_arch.RRDBNet3D(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'],
+                                          nf=opt_net['nf'], nb=opt_net['nb'], scale=opt['scale'], opt=opt)
+        else:
+            netG = RRDBNet_arch.RRDBNet(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'],
+                                        nf=opt_net['nf'], nb=opt_net['nb'], scale=opt['scale'], opt=opt)
     elif which_model == 'EDSRNet':
         Arch = find_model_using_name(which_model)
         netG = Arch(scale=opt['scale'])

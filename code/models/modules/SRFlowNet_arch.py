@@ -20,8 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from models.modules.RRDBNet_arch import RRDBNet
-from models.modules.FlowUpsamplerNet import FlowUpsamplerNet
+from models.modules.RRDBNet_arch import RRDBNet, RRDBNet3D
+from models.modules.FlowUpsamplerNet import FlowUpsamplerNet, FlowUpsamplerNet3D
 import models.modules.thops as thops
 import models.modules.flow as flow
 from utils.util import opt_get
@@ -34,7 +34,10 @@ class SRFlowNet(nn.Module):
         self.opt = opt
         self.quant = 255 if opt_get(opt, ['datasets', 'train', 'quant']) is \
                             None else opt_get(opt, ['datasets', 'train', 'quant'])
-        self.RRDB = RRDBNet(in_nc, out_nc, nf, nb, gc, scale, opt)
+        use_iso3d = opt_get(opt, ['network_G', 'isotropic3d']) or False
+        self.is_3d = use_iso3d
+        self.in_nc = in_nc
+        self.RRDB = (RRDBNet3D if use_iso3d else RRDBNet)(in_nc, out_nc, nf, nb, gc, scale, opt)
         hidden_channels = opt_get(opt, ['network_G', 'flow', 'hidden_channels'])
         hidden_channels = hidden_channels or 64
         self.RRDB_training = True  # Default is true
@@ -45,7 +48,7 @@ class SRFlowNet(nn.Module):
             self.set_rrdb_training(True)
 
         self.flowUpsamplerNet = \
-            FlowUpsamplerNet((160, 160, 3), hidden_channels, K,
+            (FlowUpsamplerNet3D if use_iso3d else FlowUpsamplerNet)((160, 160, 160, 3) if use_iso3d else (160, 160, 3), hidden_channels, K,
                              flow_coupling=opt['network_G']['flow']['coupling'], opt=opt)
         self.i = 0
 
@@ -65,7 +68,8 @@ class SRFlowNet(nn.Module):
                                     y_onehot=y_label)
         else:
             # assert lr.shape[0] == 1
-            assert lr.shape[1] == 3
+            # Allow arbitrary channel count (in_nc); previous code asserted 3.
+            assert lr.shape[1] == self.in_nc, f"Expected lr channels {self.in_nc}, got {lr.shape[1]}"
             # assert lr.shape[2] == 20
             # assert lr.shape[3] == 20
             # assert z.shape[0] == 1
@@ -132,9 +136,13 @@ class SRFlowNet(nn.Module):
                 if self.opt['scale'] == 16:
                     keys.append('fea_up16')
                 for k in keys:
-                    h = rrdbResults[k].shape[2]
-                    w = rrdbResults[k].shape[3]
-                    rrdbResults[k] = torch.cat([rrdbResults[k], F.interpolate(concat, (h, w))], dim=1)
+                    if self.is_3d:
+                        d, h, w = rrdbResults[k].shape[2:5]
+                        rrdbResults[k] = torch.cat([rrdbResults[k], F.interpolate(concat, size=(d, h, w))], dim=1)
+                    else:
+                        h = rrdbResults[k].shape[2]
+                        w = rrdbResults[k].shape[3]
+                        rrdbResults[k] = torch.cat([rrdbResults[k], F.interpolate(concat, (h, w))], dim=1)
         return rrdbResults
 
     def get_score(self, disc_loss_sigma, z):

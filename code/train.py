@@ -55,8 +55,14 @@ def main():
     parser.add_argument('--launcher', choices=['none', 'pytorch'], default='none',
                         help='job launcher')
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--isotropic3d', action='store_true',
+                        help='Use isotropic 3D RRDBNet (RRDBNet3D) instead of 2D RRDBNet.')
     args = parser.parse_args()
     opt = option.parse(args.opt, is_train=True)
+
+    # Inject isotropic3d flag into options for network creation
+    if 'network_G' in opt:
+        opt['network_G']['isotropic3d'] = bool(args.isotropic3d)
 
     #### distributed training settings
     opt['dist'] = False
@@ -224,7 +230,7 @@ def main():
                     tb_logger_train.add_scalar(k, v, current_step)
 
             # validation
-            if current_step % opt['train']['val_freq'] == 0 and rank <= 0:
+            if current_step % opt['logger']['val_freq'] == 0 and rank <= 0:
                 avg_psnr = 0.0
                 idx = 0
                 nlls = []

@@ -41,6 +41,8 @@ def create_dataset(dataset_opt):
     mode = dataset_opt['mode']
     if mode == 'LRHR_PKL':
         from data.LRHR_PKL_dataset import LRHR_PKLDataset as D
+    elif mode == 'LRHR_3D':
+        from data.Volume3D_dataset import VolumeSRDataset3D as D
     else:
         raise NotImplementedError('Dataset [{:s}] is not recognized.'.format(mode))
     dataset = D(dataset_opt)

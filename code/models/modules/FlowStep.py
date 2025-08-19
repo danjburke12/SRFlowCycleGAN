@@ -56,7 +56,7 @@ class FlowStep(nn.Module):
         self.flow_coupling = flow_coupling
         self.image_injector = image_injector
 
-    self.norm_type = normOpt['type'] if normOpt else 'ActNorm3d'
+        self.norm_type = normOpt['type'] if normOpt else 'ActNorm3d'
         self.position = normOpt['position'] if normOpt else None
 
         self.in_shape = in_shape
@@ -64,9 +64,10 @@ class FlowStep(nn.Module):
         self.acOpt = acOpt
 
         # 1. actnorm
-    # Choose 3D ActNorm by default (inputs expected (B,C,D,H,W)); fall back to 2D if needed at runtime
-    self.actnorm3d = ActNorm3d(in_channels, actnorm_scale)
-    self.actnorm2d = ActNorm2d(in_channels, actnorm_scale)
+        # Create ActNorm layers dynamically based on actual input dimensions during forward pass
+        self.actnorm3d = None
+        self.actnorm2d = None
+        self.actnorm_scale = actnorm_scale
 
         # 2. permute
         if flow_permutation == "invconv":
@@ -83,12 +84,15 @@ class FlowStep(nn.Module):
             raise RuntimeError("coupling not Found:", flow_coupling)
 
     def forward(self, input, logdet=None, reverse=False, rrdbResults=None):
+        print(f"DEBUG FlowStep forward: input.shape={input.shape}, reverse={reverse}")
         if not reverse:
             return self.normal_flow(input, logdet, rrdbResults)
         else:
             return self.reverse_flow(input, logdet, rrdbResults)
 
     def normal_flow(self, z, logdet, rrdbResults=None):
+        print(f"DEBUG FlowStep normal_flow: z.shape={z.shape}")
+        
         if self.flow_coupling == "bentIdentityPreAct":
             z, logdet = self.bentIdentPar(z, logdet, reverse=False)
 
@@ -103,15 +107,20 @@ class FlowStep(nn.Module):
             actnorm_module = self._select_actnorm(z)
             z, logdet = actnorm_module(z, logdet=logdet, reverse=False)
 
+        print(f"DEBUG FlowStep normal_flow after actnorm: z.shape={z.shape}")
+
         # 2. permute
         z, logdet = FlowStep.FlowPermutation[self.flow_permutation](
             self, z, logdet, False)
+
+        print(f"DEBUG FlowStep normal_flow after permutation: z.shape={z.shape}")
 
         need_features = self.affine_need_features()
 
         # 3. coupling
         if need_features or self.flow_coupling in ["condAffine", "condFtAffine", "condNormAffine"]:
             img_ft = getConditional(rrdbResults, self.position)
+            print(f"DEBUG FlowStep normal_flow coupling: z.shape={z.shape}, img_ft.shape={img_ft.shape if img_ft is not None else None}")
             z, logdet = self.affine(input=z, logdet=logdet, reverse=False, ft=img_ft)
         return z, logdet
 
@@ -129,8 +138,8 @@ class FlowStep(nn.Module):
             self, z, logdet, True)
 
         # 3. actnorm
-    actnorm_module = self._select_actnorm(z)
-    z, logdet = actnorm_module(z, logdet=logdet, reverse=True)
+        actnorm_module = self._select_actnorm(z)
+        z, logdet = actnorm_module(z, logdet=logdet, reverse=True)
 
         return z, logdet
 
@@ -143,5 +152,18 @@ class FlowStep(nn.Module):
         return need_features
 
     def _select_actnorm(self, z):
-        # If 5D tensor -> 3D actnorm, else 2D
-        return self.actnorm3d if z.dim() == 5 else self.actnorm2d
+        """Dynamically create and select ActNorm based on input dimensions."""
+        if z.dim() == 5:  # 3D tensor (B,C,D,H,W)
+            if self.actnorm3d is None:
+                self.actnorm3d = ActNorm3d(z.size(1), self.actnorm_scale)
+                # Move to correct device
+                if z.is_cuda:
+                    self.actnorm3d = self.actnorm3d.cuda()
+            return self.actnorm3d
+        else:  # 2D tensor (B,C,H,W)
+            if self.actnorm2d is None:
+                self.actnorm2d = ActNorm2d(z.size(1), self.actnorm_scale)
+                # Move to correct device  
+                if z.is_cuda:
+                    self.actnorm2d = self.actnorm2d.cuda()
+            return self.actnorm2d

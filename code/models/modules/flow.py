@@ -64,6 +64,28 @@ class Conv3d(nn.Conv3d):
         return x
 
 
+class Conv2dZeros(nn.Conv2d):
+    def __init__(self, in_channels, out_channels,
+                 kernel_size=3, stride=1,
+                 padding="same", logscale_factor=3):
+        if padding == "same":
+            if isinstance(kernel_size, int):
+                padding = (kernel_size - 1) // 2
+            else:
+                padding = [(k - 1) // 2 for k in kernel_size]
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding)
+        # logscale_factor
+        self.logscale_factor = logscale_factor
+        self.register_parameter("logs", nn.Parameter(torch.zeros(out_channels, 1, 1)))
+        # init
+        self.weight.data.zero_()
+        self.bias.data.zero_()
+
+    def forward(self, input):
+        output = super().forward(input)
+        return output * torch.exp(self.logs * self.logscale_factor)
+
+
 class Conv3dZeros(nn.Conv3d):
     def __init__(self, in_channels, out_channels,
                  kernel_size=[3, 3, 3], stride=[1, 1, 1],
