@@ -85,6 +85,9 @@ class FlowStep(nn.Module):
 
     def forward(self, input, logdet=None, reverse=False, rrdbResults=None):
         print(f"DEBUG FlowStep forward: input.shape={input.shape}, reverse={reverse}")
+        # Runtime assertion: if input is 5D, ensure all ops are 3D
+        if input.dim() == 5:
+            print("DEBUG FlowStep: 5D input detected (B,C,D,H,W)")
         if not reverse:
             return self.normal_flow(input, logdet, rrdbResults)
         else:

@@ -128,6 +128,10 @@ class SRModel(BaseModel):
         l_pix.backward()
         self.optimizer_G.step()
 
+        # Update learning rate scheduler
+        for scheduler in self.schedulers:
+            scheduler.step()
+
         # set log
         self.log_dict['l_pix'] = l_pix.item()
 

@@ -17,10 +17,11 @@
 import numpy as np
 import torch
 from torch import nn as nn
+import torch.utils.checkpoint
 
-import models.modules.Split
 from models.modules import flow, thops
-from models.modules.Split import Split2d, Split3d
+from models.modules.split_flow import Split2d, Split3d
+from .checkpoint_util import checkpoint_wrapper
 from models.modules.glow_arch import f_conv2d_bias, f_conv3d_bias
 from models.modules.FlowStep import FlowStep
 from utils.util import opt_get
@@ -81,21 +82,67 @@ class FlowUpsamplerNet(nn.Module):
                 4: 'last_lr_fea'
             }
 
-        affineInCh = self.get_affineInCh(opt_get)
-        flow_permutation = self.get_flow_permutation(flow_permutation, opt)
+        # Initialize levelToName dictionary for different scales
+        scale = opt.get('scale', 1)
+        if scale == 16:
+            self.levelToName = {
+                0: 'fea_up16',
+                1: 'fea_up8',
+                2: 'fea_up4',
+                3: 'fea_up2',
+                4: 'fea_up1',
+            }
+        elif scale == 8:
+            self.levelToName = {
+                0: 'fea_up8',
+                1: 'fea_up4',
+                2: 'fea_up2',
+                3: 'fea_up1',
+                4: 'fea_up0'
+            }
+        elif scale == 4:
+            self.levelToName = {
+                0: 'fea_up4',
+                1: 'fea_up2',
+                2: 'fea_up1',
+                3: 'fea_up0',
+                4: 'fea_up-1'
+            }
+        elif scale == 2:
+            self.levelToName = {
+                0: 'fea_up2',
+                1: 'fea_up1',
+                2: 'fea_up0',
+                3: 'fea_up-1',
+                4: 'last_lr_fea'
+            }
+        else:
+            # Fallback for unknown scale
+            self.levelToName = {i: f'fea_up{i}' for i in range(5)}
 
+        # Initialize flow parameters
+        blocks = opt_get(opt, ['network_G', 'flow', 'stackRRDB', 'blocks'])
+        if blocks is None:
+            affineInCh = 64 
+        elif isinstance(blocks, (list, tuple)):
+            affineInCh = (len(blocks) + 1) * 64
+        else:
+            affineInCh = (blocks + 1) * 64  # If blocks is an integer
+        flow_permutation = self.get_flow_permutation(flow_permutation, opt)
         normOpt = opt_get(opt, ['network_G', 'flow', 'norm'])
 
         conditional_channels = {}
         n_rrdb = self.get_n_rrdb_channels(opt, opt_get)
         n_bypass_channels = opt_get(opt, ['network_G', 'flow', 'levelConditional', 'n_channels'])
+        if n_bypass_channels is None:
+            n_bypass_channels = 0
         conditional_channels[0] = n_rrdb
         for level in range(1, self.L + 1):
             # Level 1 gets conditionals from 2, 3, 4 => L - level
             # Level 2 gets conditionals from 3, 4
             # Level 3 gets conditionals from 4
             # Level 4 gets conditionals from None
-            n_bypass = 0 if n_bypass_channels is None else (self.L - level) * n_bypass_channels
+            n_bypass = (self.L - level) * n_bypass_channels
             conditional_channels[level] = n_rrdb + n_bypass
 
         # Upsampler
@@ -124,11 +171,14 @@ class FlowUpsamplerNet(nn.Module):
 
     def get_n_rrdb_channels(self, opt, opt_get):
         blocks = opt_get(opt, ['network_G', 'flow', 'stackRRDB', 'blocks'])
-        if blocks is not None:
-            n_rrdb = (len(blocks) + 1) * 64
-        else:
+        if blocks is None:
             # Use the actual RRDB network's feature dimension
             n_rrdb = opt_get(opt, ['network_G', 'nf'], 64)
+        elif isinstance(blocks, (list, tuple)):
+            n_rrdb = (len(blocks) + 1) * 64
+        else:
+            # Treat blocks as an integer
+            n_rrdb = (blocks + 1) * 64
         print(f"DEBUG get_n_rrdb_channels: returning {n_rrdb}")
         return n_rrdb
 
@@ -170,15 +220,9 @@ class FlowUpsamplerNet(nn.Module):
             cond_channels = opt_get(opt, ['network_G', 'flow', 'split', 'cond_channels'])
             cond_channels = 0 if cond_channels is None else cond_channels
 
-            t = opt_get(opt, ['network_G', 'flow', 'split', 'type'], 'Split2d')
-
-            if t == 'Split2d':
-                split = models.modules.Split.Split2d(num_channels=self.C, logs_eps=logs_eps, position=position,
-                                                     cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
-            else:
-                # Default to Split2d for 2D case
-                split = models.modules.Split.Split2d(num_channels=self.C, logs_eps=logs_eps, position=position,
-                                                     cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
+            # Always use Split3d for 3D volumetric input
+            split = Split3d(num_channels=self.C, logs_eps=logs_eps, position=position,
+                                                 cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
             self.layers.append(split)
             self.output_shapes.append([-1, split.num_channels_pass, H, W])
             self.C = split.num_channels_pass
@@ -213,25 +257,31 @@ class FlowUpsamplerNet(nn.Module):
         return affineInCh
 
     def check_image_shape(self):
-        assert self.C == 1 or self.C == 3, ("image_shape should be HWC, like (64, 64, 3)"
-                                            "self.C == 1 or self.C == 3")
+        # Channel dimension can now be any size to support temporal data
+        assert self.C > 0, "Channel dimension must be positive"
 
     def forward(self, gt=None, rrdbResults=None, z=None, epses=None, logdet=0., reverse=False, eps_std=None,
-                y_onehot=None):
+                y_onehot=None, max_depth=100):
+
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
 
         if reverse:
             epses_copy = [eps for eps in epses] if isinstance(epses, list) else epses
 
-            sr, logdet = self.decode(rrdbResults, z, eps_std, epses=epses_copy, logdet=logdet, y_onehot=y_onehot)
+            sr, logdet = self.decode(rrdbResults, z, eps_std, epses=epses_copy, logdet=logdet, y_onehot=y_onehot, max_depth=max_depth-1)
             return sr, logdet
         else:
             assert gt is not None
             assert rrdbResults is not None
-            z, logdet = self.encode(gt, rrdbResults, logdet=logdet, epses=epses, y_onehot=y_onehot)
+            z, logdet = self.encode(gt, rrdbResults, logdet=logdet, epses=epses, y_onehot=y_onehot, max_depth=max_depth-1)
 
             return z, logdet
 
-    def encode(self, gt, rrdbResults, logdet=0.0, epses=None, y_onehot=None):
+    def encode(self, gt, rrdbResults, logdet=0.0, epses=None, y_onehot=None, max_depth=100):
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
+        
         fl_fea = gt
         reverse = False
         level_conditionals = {}
@@ -336,6 +386,7 @@ class FlowUpsamplerNet3D(nn.Module):
                  LU_decomposed=False, opt=None):
 
         super().__init__()
+        self.use_checkpoint = False
 
         self.layers = nn.ModuleList()
         self.output_shapes = []
@@ -358,15 +409,25 @@ class FlowUpsamplerNet3D(nn.Module):
                 3: 'fea_up2',
                 4: 'fea_up1',
             }
-        elif opt['scale'] == 8:
+        # Always define levelToName for all scales
+        scale = opt.get('scale', 1)
+        if scale == 16:
+            self.levelToName = {
+                0: 'fea_up16',
+                1: 'fea_up8',
+                2: 'fea_up4',
+                3: 'fea_up2',
+                4: 'fea_up1',
+            }
+        elif scale == 8:
             self.levelToName = {
                 0: 'fea_up8',
                 1: 'fea_up4',
-                2: 'fea_up2', 
+                2: 'fea_up2',
                 3: 'fea_up1',
                 4: 'fea_up0'
             }
-        elif opt['scale'] == 4:
+        elif scale == 4:
             self.levelToName = {
                 0: 'fea_up4',
                 1: 'fea_up2',
@@ -374,7 +435,7 @@ class FlowUpsamplerNet3D(nn.Module):
                 3: 'fea_up0',
                 4: 'fea_up-1'
             }
-        elif opt['scale'] == 2:
+        elif scale == 2:
             self.levelToName = {
                 0: 'fea_up2',
                 1: 'fea_up1',
@@ -382,18 +443,23 @@ class FlowUpsamplerNet3D(nn.Module):
                 3: 'fea_up-1',
                 4: 'last_lr_fea'
             }
-
+        else:
+            # Fallback for unknown scale
+            self.levelToName = {i: f'fea_up{i}' for i in range(5)}
+        # Initialize conditional channels
         affineInCh = self.get_affineInCh(opt_get)
         flow_permutation = self.get_flow_permutation(flow_permutation, opt)
-
         normOpt = opt_get(opt, ['network_G', 'flow', 'norm'])
-
+        
         conditional_channels = {}
         n_rrdb = self.get_n_rrdb_channels(opt, opt_get)
         n_bypass_channels = opt_get(opt, ['network_G', 'flow', 'levelConditional', 'n_channels'])
+        if n_bypass_channels is None:
+            n_bypass_channels = 0
+        
         conditional_channels[0] = n_rrdb
         for level in range(1, self.L + 1):
-            n_bypass = 0 if n_bypass_channels is None else (self.L - level) * n_bypass_channels
+            n_bypass = (self.L - level) * n_bypass_channels
             conditional_channels[level] = n_rrdb + n_bypass
 
         # Upsampler
@@ -410,10 +476,12 @@ class FlowUpsamplerNet3D(nn.Module):
             # Split
             self.arch_split(D, H, W, level, self.L, opt, opt_get)
 
+        # Always use 3D convolutions for 5D input
+        print(f"DEBUG: Using FlowUpsamplerNet3D with only 3D convolutions (f_conv3d_bias), affineInCh={affineInCh}")
         if opt_get(opt, ['network_G', 'flow', 'split', 'enable']):
-            self.f = f_conv3d_bias(affineInCh, 2 * 1 * 64 // 2 // 2)  # Changed from 3 to 1 channels, use 3D conv
+            self.f = f_conv3d_bias(affineInCh, 2 * 1 * 64 // 2 // 2)
         else:
-            self.f = f_conv3d_bias(affineInCh, 2 * 1 * 64)  # Changed from 3 to 1 channels, use 3D conv
+            self.f = f_conv3d_bias(affineInCh, 2 * 1 * 64)
 
         self.D = D
         self.H = H
@@ -476,18 +544,9 @@ class FlowUpsamplerNet3D(nn.Module):
             cond_channels = opt_get(opt, ['network_G', 'flow', 'split', 'cond_channels'])
             cond_channels = 0 if cond_channels is None else cond_channels
 
-            t = opt_get(opt, ['network_G', 'flow', 'split', 'type'], 'Split3d')  # Default to 3D
-
-            if t == 'Split3d':
-                split = Split3d(num_channels=self.C, logs_eps=logs_eps, position=position,
-                               cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
-            elif t == 'Split2d':  # Fallback for compatibility
-                split = models.modules.Split.Split2d(num_channels=self.C, logs_eps=logs_eps, position=position,
-                                                     cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
-            else:
-                # Default to Split3d for safety
-                split = Split3d(num_channels=self.C, logs_eps=logs_eps, position=position,
-                               cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
+            # Always use Split3d for 3D volumetric input
+            split = Split3d(num_channels=self.C, logs_eps=logs_eps, position=position,
+                           cond_channels=cond_channels, consume_ratio=consume_ratio, opt=opt)
             self.layers.append(split)
             self.output_shapes.append([-1, split.num_channels_pass, D, H, W])
             self.C = split.num_channels_pass
@@ -522,44 +581,54 @@ class FlowUpsamplerNet3D(nn.Module):
         return affineInCh
 
     def check_image_shape(self):
-        assert self.C == 1 or self.C == 3, ("image_shape should be DHWC, like (32, 64, 64, 1)"
-                                            "self.C == 1 or self.C == 3")
+        # Channel dimension can now be any size to support temporal data
+        assert self.C > 0, "Channel dimension must be positive"
 
     def forward(self, gt=None, rrdbResults=None, z=None, epses=None, logdet=0., reverse=False, eps_std=None,
-                y_onehot=None):
+                y_onehot=None, max_depth=100):
+
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
 
         if reverse:
             epses_copy = [eps for eps in epses] if isinstance(epses, list) else epses
-            sr, logdet = self.decode(rrdbResults, z, eps_std, epses=epses_copy, logdet=logdet, y_onehot=y_onehot)
+            sr, logdet = self.decode(rrdbResults, z, eps_std, epses=epses_copy, logdet=logdet, 
+                                   y_onehot=y_onehot, max_depth=max_depth-1)
             return sr, logdet
         else:
             assert gt is not None
             assert rrdbResults is not None
-            z, logdet = self.encode(gt, rrdbResults, logdet=logdet, epses=epses, y_onehot=y_onehot)
+            z, logdet = self.encode(gt, rrdbResults, logdet=logdet, epses=epses, 
+                                  y_onehot=y_onehot, max_depth=max_depth-1)
             return z, logdet
 
-    def encode(self, gt, rrdbResults, logdet=0.0, epses=None, y_onehot=None):
+    def encode(self, gt, rrdbResults, logdet=0.0, epses=None, y_onehot=None, max_depth=100):
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
+            
         fl_fea = gt
-        print(f"DEBUG FlowUpsamplerNet3D encode: gt.shape={gt.shape}, fl_fea.shape={fl_fea.shape}")
-        
-        # Convert single channel to 3 channels by replication for compatibility with flow architecture
-        if fl_fea.shape[1] == 1:
-            fl_fea = fl_fea.repeat(1, 3, 1, 1, 1)
-            print(f"DEBUG FlowUpsamplerNet3D encode: After channel replication, fl_fea.shape={fl_fea.shape}")
-        
         reverse = False
         level_conditionals = {}
         bypasses = {}
 
         L = opt_get(self.opt, ['network_G', 'flow', 'L'])
+        
+        def layer_fn(layer, fl_fea, logdet, level_conditional=None):
+            """Function for gradient checkpointing."""
+            if isinstance(layer, FlowStep):
+                return layer(fl_fea, logdet, reverse=reverse, rrdbResults=level_conditional)
+            elif isinstance(layer, Split3d):
+                ft = None if layer.position is None else level_conditional
+                return layer(fl_fea, logdet, reverse=reverse, eps=epses, ft=ft, y_onehot=y_onehot)
+            else:
+                return layer(fl_fea, logdet, reverse=reverse)
 
         for level in range(1, L + 1):
             # Use trilinear interpolation for 3D downsampling
             bypasses[level] = torch.nn.functional.interpolate(gt, scale_factor=2 ** -level, mode='trilinear', align_corners=False)
 
-        print(f"DEBUG FlowUpsamplerNet3D encode: Starting layer processing, fl_fea.shape={fl_fea.shape}")
         for layer, shape in zip(self.layers, self.output_shapes):
-            # Use minimum spatial dimension for level calculation
+            # Use minimum spatial dimension for level calculation 
             min_spatial = min(shape[2], shape[3], shape[4])
             level = int(np.log(160 / min_spatial) / np.log(2))
 
@@ -568,17 +637,19 @@ class FlowUpsamplerNet3D(nn.Module):
 
             level_conditionals[level] = rrdbResults[self.levelToName[level]]
 
-            print(f"DEBUG FlowUpsamplerNet3D encode: Processing layer {layer.__class__.__name__}, fl_fea.shape={fl_fea.shape}, expected_shape={shape}")
-            
-            if isinstance(layer, FlowStep):
-                fl_fea, logdet = layer(fl_fea, logdet, reverse=reverse, rrdbResults=level_conditionals[level])
-            elif isinstance(layer, (Split2d, Split3d)):
-                fl_fea, logdet = self.forward_split(epses, fl_fea, layer, logdet, reverse, level_conditionals[level],
-                                                   y_onehot=y_onehot)
+            if self.use_checkpoint and self.training:
+                fl_fea, logdet = checkpoint_wrapper(
+                    layer_fn, 
+                    (layer, fl_fea, logdet, level_conditionals.get(level))
+                )
             else:
-                fl_fea, logdet = layer(fl_fea, logdet, reverse=reverse)
-                
-            print(f"DEBUG FlowUpsamplerNet3D encode: After processing layer {layer.__class__.__name__}, fl_fea.shape={fl_fea.shape}")
+                if isinstance(layer, FlowStep):
+                    fl_fea, logdet = layer(fl_fea, logdet, reverse=reverse, rrdbResults=level_conditionals[level])
+                elif isinstance(layer, (Split2d, Split3d)):
+                    fl_fea, logdet = self.forward_split2d(epses, fl_fea, layer, logdet, reverse, level_conditionals[level],
+                                                       y_onehot=y_onehot)
+                else:
+                    fl_fea, logdet = layer(fl_fea, logdet, reverse=reverse)
 
         z = fl_fea
 
@@ -594,7 +665,10 @@ class FlowUpsamplerNet3D(nn.Module):
                 fl_fea, logdet = l(fl_fea, logdet, reverse=reverse)
         return fl_fea, logdet
 
-    def forward_split(self, epses, fl_fea, layer, logdet, reverse, rrdbResults, y_onehot=None):
+    def forward_split(self, epses, fl_fea, layer, logdet, reverse, rrdbResults, y_onehot=None, max_depth=100):
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
+
         ft = None if layer.position is None else rrdbResults[layer.position]
         fl_fea, logdet, eps = layer(fl_fea, logdet, reverse=reverse, eps=epses, ft=ft, y_onehot=y_onehot)
 
@@ -602,7 +676,10 @@ class FlowUpsamplerNet3D(nn.Module):
             epses.append(eps)
         return fl_fea, logdet
 
-    def decode(self, rrdbResults, z, eps_std=None, epses=None, logdet=0.0, y_onehot=None):
+    def decode(self, rrdbResults, z, eps_std=None, epses=None, logdet=0.0, y_onehot=None, max_depth=100):
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
+            
         z = epses.pop() if isinstance(epses, list) else z
 
         fl_fea = z
@@ -617,32 +694,56 @@ class FlowUpsamplerNet3D(nn.Module):
             min_spatial = min(shape[2], shape[3], shape[4])
             level = int(np.log(160 / min_spatial) / np.log(2))
 
-            if isinstance(layer, (Split2d, Split3d)):
-                fl_fea, logdet = self.forward_split_reverse(eps_std, epses, fl_fea, layer,
-                                                           rrdbResults[self.levelToName[level]], logdet=logdet,
-                                                           y_onehot=y_onehot)
-            elif isinstance(layer, FlowStep):
-                fl_fea, logdet = layer(fl_fea, logdet=logdet, reverse=True, rrdbResults=level_conditionals[level])
+            def decode_layer_fn(layer, fl_fea, logdet, level_conditional=None):
+                """Function for gradient checkpointing in decode path."""
+                if isinstance(layer, (Split2d, Split3d)):
+                    ft = None if layer.position is None else level_conditional
+                    return layer(fl_fea, logdet=logdet, reverse=True,
+                               eps=epses.pop() if isinstance(epses, list) else None,
+                               eps_std=eps_std, ft=ft, y_onehot=y_onehot)
+                elif isinstance(layer, FlowStep):
+                    return layer(fl_fea, logdet=logdet, reverse=True, rrdbResults=level_conditional)
+                else:
+                    return layer(fl_fea, logdet=logdet, reverse=True)
+
+            if self.use_checkpoint and self.training:
+                fl_fea, logdet = checkpoint_wrapper(
+                    decode_layer_fn,
+                    (layer, fl_fea, logdet, level_conditionals.get(level))
+                )
             else:
-                fl_fea, logdet = layer(fl_fea, logdet=logdet, reverse=True)
+                if isinstance(layer, (Split2d, Split3d)):
+                    fl_fea, logdet = self.forward_split_reverse(eps_std, epses, fl_fea, layer,
+                                                               rrdbResults[self.levelToName[level]], logdet=logdet,
+                                                               y_onehot=y_onehot, max_depth=max_depth-1)
+                elif isinstance(layer, FlowStep):
+                    fl_fea, logdet = layer(fl_fea, logdet=logdet, reverse=True, rrdbResults=level_conditionals[level])
+                else:
+                    fl_fea, logdet = layer(fl_fea, logdet=logdet, reverse=True)
 
         sr = fl_fea
         
-        # Convert back to single channel if it was originally single channel
-        # (Take average of the 3 replicated channels)
-        if sr.shape[1] == 3:
-            sr = sr.mean(dim=1, keepdim=True)
-            print(f"DEBUG FlowUpsamplerNet3D decode: Converted back to single channel, sr.shape={sr.shape}")
-
-        assert sr.shape[1] == 1 or sr.shape[1] == 3  # Allow both 1 and 3 channels
+        # No need to convert channels since we're working with single channel directly
+        assert sr.shape[1] == 1  # Verify single channel output
         return sr, logdet
 
-    def forward_split_reverse(self, eps_std, epses, fl_fea, layer, rrdbResults, logdet, y_onehot=None):
+    def forward_split_reverse(self, eps_std, epses, fl_fea, layer, rrdbResults, logdet, y_onehot=None, max_depth=100):
+        if max_depth <= 0:
+            raise RuntimeError("Maximum recursion depth exceeded")
+
         ft = None if layer.position is None else rrdbResults[layer.position]
         fl_fea, logdet = layer(fl_fea, logdet=logdet, reverse=True,
                                eps=epses.pop() if isinstance(epses, list) else None,
                                eps_std=eps_std, ft=ft, y_onehot=y_onehot)
         return fl_fea, logdet
+        
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing to save memory."""
+        self.use_checkpoint = True
+        
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.use_checkpoint = False
 
 
 def get_position_name_3d(D, H, W, scale):

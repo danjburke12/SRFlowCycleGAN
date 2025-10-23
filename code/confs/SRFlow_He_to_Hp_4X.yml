@@ -15,11 +15,11 @@
 # This file contains content licensed by https://github.com/xinntao/BasicSR/blob/master/LICENSE/LICENSE
 
 #### general settings
-name: train
+name: He_to_Hp_train
 use_tb_logger: true
 model: SRFlow
 distortion: sr
-scale: 4
+scale: 1  # No upscaling for volume-to-volume conversion
 gpu_ids: [ 0 ]
 
 #### datasets
@@ -48,12 +48,6 @@ datasets:
     width: 32
     patch_size: 32
 
-#### Test Settings
-dataroot_GT: ../datasets/div2k-validation-modcrop8-gt
-dataroot_LR: ../datasets/div2k-validation-modcrop8-x4
-model_path: ../pretrained_models/SRFlow_DF2K_4X.pth
-heat: 0.9 # This is the standard deviation of the latent vectors
-
 #### network structures
 network_G:
   which_model_G: SRFlowNet
@@ -62,8 +56,8 @@ network_G:
   nf: 64
   nb: 23
   upscale: 1  # No upscaling for volume-to-volume conversion
-  train_RRDB: false
-  train_RRDB_delay: 0.5
+  train_RRDB: true  # Train RRDB from scratch instead of using pretrained
+  train_RRDB_delay: 0.0  # Start training RRDB immediately
   use_iso3d: true  # Enable 3D convolutions
 
   flow:
@@ -81,9 +75,8 @@ network_G:
 
 #### path
 path:
-  pretrain_model_G: ../pretrained_models/RRDB_DF2K_4X.pth
   strict_load: true
-  resume_state: auto
+  resume_state: ~  # No resume for fresh training
 
 #### training settings: learning rate scheme, loss
 train:

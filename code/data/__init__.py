@@ -39,8 +39,16 @@ def create_dataloader(dataset, dataset_opt, opt=None, sampler=None):
 def create_dataset(dataset_opt):
     print(dataset_opt)
     mode = dataset_opt['mode']
-    if mode == 'LRHR_PKL':
+    datatype = dataset_opt.get('datatype', '')  # Get datatype from config
+    
+    if datatype == 'volume':
+        from data.volume_dataset import VolumeDataset as D
+    elif mode == 'LRHR_PKL':
         from data.LRHR_PKL_dataset import LRHR_PKLDataset as D
+    elif mode == 'LRHR_PKL_dataset_v6':
+        from data.LRHR_PKL_dataset_v6 import LRHR_PKLDataset as D
+    elif mode == 'LRHR_PKL_dataset_v7':
+        from data.LRHR_PKL_dataset_v7 import LRHR_PKLDataset as D
     elif mode == 'LRHR_3D':
         from data.Volume3D_dataset import VolumeSRDataset3D as D
     else:

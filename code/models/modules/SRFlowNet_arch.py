@@ -22,8 +22,7 @@ import torch.nn.functional as F
 import numpy as np
 from models.modules.RRDBNet_arch import RRDBNet, RRDBNet3D
 from models.modules.FlowUpsamplerNet import FlowUpsamplerNet, FlowUpsamplerNet3D
-import models.modules.thops as thops
-import models.modules.flow as flow
+from models.modules import thops, flow
 from utils.util import opt_get
 
 
@@ -37,7 +36,27 @@ class SRFlowNet(nn.Module):
         use_iso3d = opt_get(opt, ['network_G', 'isotropic3d']) or False
         self.is_3d = use_iso3d
         self.in_nc = in_nc
-        self.RRDB = (RRDBNet3D if use_iso3d else RRDBNet)(in_nc, out_nc, nf, nb, gc, scale, opt)
+        print(f"DEBUG SRFlowNet: opt['network_G'] = {opt.get('network_G', None)}")
+        print(f"DEBUG SRFlowNet: use_iso3d = {use_iso3d}")
+        # Always use RRDBNet3D for 3D input (5D tensor)
+        if use_iso3d:
+            print("DEBUG SRFlowNet: Using RRDBNet3D for volumetric data")
+            self.RRDB = RRDBNet3D(in_nc, out_nc, nf, nb, gc, scale, opt)
+        else:
+            print("DEBUG SRFlowNet: Using RRDBNet (2D) for image data")
+            self.RRDB = RRDBNet(in_nc, out_nc, nf, nb, gc, scale, opt)
+
+        # Runtime assertion: if input is 5D, must use RRDBNet3D
+        original_forward = self.RRDB.forward
+        def rrdb_forward_patch(x, get_steps=False):
+            if x.dim() == 5:
+                # Error if not using RRDBNet3D for volumetric data
+                if not use_iso3d or not isinstance(self.RRDB, RRDBNet3D):
+                    print(f"RRDB type: {type(self.RRDB)}")
+                    print(f"use_iso3d: {use_iso3d}")
+                    raise ValueError("ERROR: 5D input detected but RRDBNet3D not properly configured! Check isotropic3d setting.")
+            return original_forward(x, get_steps=get_steps)
+        self.RRDB.forward = rrdb_forward_patch
         hidden_channels = opt_get(opt, ['network_G', 'flow', 'hidden_channels'])
         hidden_channels = hidden_channels or 64
         self.RRDB_training = True  # Default is true
@@ -47,9 +66,28 @@ class SRFlowNet(nn.Module):
         if set_RRDB_to_train:
             self.set_rrdb_training(True)
 
-        self.flowUpsamplerNet = \
-            (FlowUpsamplerNet3D if use_iso3d else FlowUpsamplerNet)((160, 160, 160, 3) if use_iso3d else (160, 160, 3), hidden_channels, K,
-                             flow_coupling=opt['network_G']['flow']['coupling'], opt=opt)
+        # Get patch size from config or use default
+        patch_size = opt_get(opt, ['datasets', 'train', 'patch_size']) or 64
+        
+        if use_iso3d:
+            # For 3D data, shape is (D, H, W, C)
+            input_shape = (patch_size, patch_size, patch_size, in_nc)
+            self.flowUpsamplerNet = FlowUpsamplerNet3D(
+                input_shape, 
+                hidden_channels, 
+                K,
+                flow_coupling=opt['network_G']['flow']['coupling'],
+                opt=opt)
+        else:
+            # For 2D data, shape is (H, W, C)
+            input_shape = (patch_size, patch_size, in_nc)
+            self.flowUpsamplerNet = FlowUpsamplerNet(
+                input_shape,
+                hidden_channels,
+                K,
+                flow_coupling=opt['network_G']['flow']['coupling'],
+                opt=opt)
+                
         self.i = 0
 
     def set_rrdb_training(self, trainable):
@@ -61,15 +99,15 @@ class SRFlowNet(nn.Module):
         return False
 
     def forward(self, gt=None, lr=None, z=None, eps_std=None, reverse=False, epses=None, reverse_with_grad=False,
-                lr_enc=None,
-                add_gt_noise=False, step=None, y_label=None):
+                lr_enc=None, add_gt_noise=False, step=None, y_label=None, max_depth=100):
         if not reverse:
             return self.normal_flow(gt, lr, epses=epses, lr_enc=lr_enc, add_gt_noise=add_gt_noise, step=step,
-                                    y_onehot=y_label)
+                                    y_onehot=y_label, max_depth=max_depth)
         else:
-            # assert lr.shape[0] == 1
-            # Allow arbitrary channel count (in_nc); previous code asserted 3.
-            assert lr.shape[1] == self.in_nc, f"Expected lr channels {self.in_nc}, got {lr.shape[1]}"
+            # Remove channel assertion since we're handling temporal data as channels
+            batch_size, channels, height, width = lr.shape
+            # Store original shape for reconstruction
+            self.temporal_shape = (batch_size, channels, height, width)
             # assert lr.shape[2] == 20
             # assert lr.shape[3] == 20
             # assert z.shape[0] == 1
@@ -78,18 +116,24 @@ class SRFlowNet(nn.Module):
             # assert z.shape[3] == 20
             if reverse_with_grad:
                 return self.reverse_flow(lr, z, y_onehot=y_label, eps_std=eps_std, epses=epses, lr_enc=lr_enc,
-                                         add_gt_noise=add_gt_noise)
+                                         add_gt_noise=add_gt_noise, max_depth=max_depth)
             else:
                 with torch.no_grad():
                     return self.reverse_flow(lr, z, y_onehot=y_label, eps_std=eps_std, epses=epses, lr_enc=lr_enc,
-                                             add_gt_noise=add_gt_noise)
+                                             add_gt_noise=add_gt_noise, max_depth=max_depth)
 
-    def normal_flow(self, gt, lr, y_onehot=None, epses=None, lr_enc=None, add_gt_noise=True, step=None):
+    def normal_flow(self, gt, lr, y_onehot=None, epses=None, lr_enc=None, add_gt_noise=True, step=None, max_depth=100):
         if lr_enc is None:
             lr_enc = self.rrdbPreprocessing(lr)
 
-        logdet = torch.zeros_like(gt[:, 0, 0, 0])
-        pixels = thops.pixels(gt)
+        if self.is_3d:
+            # For 3D data (B, C, D, H, W)
+            logdet = torch.zeros_like(gt[:, 0, 0, 0, 0])
+            pixels = gt.shape[2] * gt.shape[3] * gt.shape[4]  # D * H * W
+        else:
+            # Original 2D behavior
+            logdet = torch.zeros_like(gt[:, 0, 0, 0])
+            pixels = thops.pixels(gt)
 
         z = gt
 
@@ -102,7 +146,7 @@ class SRFlowNet(nn.Module):
 
         # Encode
         epses, logdet = self.flowUpsamplerNet(rrdbResults=lr_enc, gt=z, logdet=logdet, reverse=False, epses=epses,
-                                              y_onehot=y_onehot)
+                                              y_onehot=y_onehot, max_depth=max_depth)
 
         objective = logdet.clone()
 
@@ -115,14 +159,31 @@ class SRFlowNet(nn.Module):
 
         nll = (-objective) / float(np.log(2.) * pixels)
 
+        # Return appropriate format based on whether epses is a list
         if isinstance(epses, list):
-            return epses, nll, logdet
-        return z, nll, logdet
+            # When intermediate results are requested
+            if self.is_3d:
+                # For 3D data, ensure proper shape
+                return [eps.contiguous() for eps in epses], nll.contiguous(), logdet.contiguous()
+            else:
+                # Original 2D behavior
+                return epses, nll, logdet
+        else:
+            # Single result case
+            if self.is_3d:
+                # For 3D data, ensure proper shape
+                return z.contiguous(), nll.contiguous(), logdet.contiguous()
+            else:
+                # Original 2D behavior
+                return z, nll, logdet
 
     def rrdbPreprocessing(self, lr):
         rrdbResults = self.RRDB(lr, get_steps=True)
-        block_idxs = opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'blocks']) or []
-        if len(block_idxs) > 0:
+        block_idxs = opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'blocks']) 
+        if block_idxs and not isinstance(block_idxs, (list, tuple)):
+            block_idxs = [block_idxs]  # Convert single value to list
+        block_idxs = block_idxs or []  # Ensure we have a list, even if empty
+        if block_idxs:
             concat = torch.cat([rrdbResults["block_{}".format(idx)] for idx in block_idxs], dim=1)
 
             if opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'concat']) or False:
@@ -136,6 +197,16 @@ class SRFlowNet(nn.Module):
                 if self.opt['scale'] == 16:
                     keys.append('fea_up16')
                 for k in keys:
+                    if k not in rrdbResults:
+                        # Fallback: create zeros of correct shape
+                        if self.is_3d:
+                            # Use shape from last_lr_fea
+                            d, h, w = rrdbResults['last_lr_fea'].shape[2:5]
+                            rrdbResults[k] = torch.zeros_like(rrdbResults['last_lr_fea'])
+                        else:
+                            h = rrdbResults['last_lr_fea'].shape[2]
+                            w = rrdbResults['last_lr_fea'].shape[3]
+                            rrdbResults[k] = torch.zeros_like(rrdbResults['last_lr_fea'])
                     if self.is_3d:
                         d, h, w = rrdbResults[k].shape[2:5]
                         rrdbResults[k] = torch.cat([rrdbResults[k], F.interpolate(concat, size=(d, h, w))], dim=1)
@@ -150,7 +221,7 @@ class SRFlowNet(nn.Module):
                      z.shape[1] * z.shape[2] * z.shape[3] * math.log(disc_loss_sigma)
         return -score_real
 
-    def reverse_flow(self, lr, z, y_onehot, eps_std, epses=None, lr_enc=None, add_gt_noise=True):
+    def reverse_flow(self, lr, z, y_onehot, eps_std, epses=None, lr_enc=None, add_gt_noise=True, max_depth=100):
         logdet = torch.zeros_like(lr[:, 0, 0, 0])
         pixels = thops.pixels(lr) * self.opt['scale'] ** 2
 
@@ -161,6 +232,6 @@ class SRFlowNet(nn.Module):
             lr_enc = self.rrdbPreprocessing(lr)
 
         x, logdet = self.flowUpsamplerNet(rrdbResults=lr_enc, z=z, eps_std=eps_std, reverse=True, epses=epses,
-                                          logdet=logdet)
+                                          logdet=logdet, max_depth=max_depth)
 
         return x, logdet

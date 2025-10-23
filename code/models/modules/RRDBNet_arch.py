@@ -114,7 +114,8 @@ class RRDBNet3D(nn.Module):
     def forward(self, x, get_steps=False):
         fea = self.conv_first(x)
 
-        block_idxs = opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'blocks']) or []
+        block_idxs = opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'blocks'])
+        block_idxs = [i for i in range(block_idxs)] if isinstance(block_idxs, int) else (block_idxs or [])
         block_results = {}
         for idx, m in enumerate(self.RRDB_trunk.children()):
             fea = m(fea)
@@ -217,14 +218,14 @@ class RRDBNet(nn.Module):
     def forward(self, x, get_steps=False):
         fea = self.conv_first(x)
 
-        block_idxs = opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'blocks']) or []
+        block_idxs = opt_get(self.opt, ['network_G', 'flow', 'stackRRDB', 'blocks']) 
+        block_idxs = [i for i in range(block_idxs)] if isinstance(block_idxs, int) else (block_idxs or [])
         block_results = {}
 
         for idx, m in enumerate(self.RRDB_trunk.children()):
             fea = m(fea)
-            for b in block_idxs:
-                if b == idx:
-                    block_results["block_{}".format(idx)] = fea
+            if idx in block_idxs:
+                block_results["block_{}".format(idx)] = fea
 
         trunk = self.trunk_conv(fea)
 

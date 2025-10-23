@@ -1,0 +1,89 @@
+name: RRDB_SRFlow_He_to_Hp_volume
+use_tb_logger: true
+distortion: sr
+scale: 1
+gpu_ids: [0]
+model: SRFlow
+
+datasets:
+  train:
+    name: LRHR_PKL
+    mode: LRHR_PKL_dataset_v7 
+    dataroot_GT: D:/Daniel/SRFlowCycleGAN/data/Hp/Hp_train.pklv4
+    dataroot_LQ: D:/Daniel/SRFlowCycleGAN/data/He/He_train.pklv4
+    batch_size: 1  # Reduced batch size to save memory
+    use_shuffle: true
+    n_workers: 0
+    use_flip: true
+    use_rot: true
+    n_max: 500
+    use_fp16: true  # Enable mixed precision training
+
+  val:
+    name: LRHR_PKL
+    mode: LRHR_PKL_dataset_v7  
+    dataroot_GT: D:/Daniel/SRFlowCycleGAN/data/Hp/Hp_val.pklv4
+    dataroot_LQ: D:/Daniel/SRFlowCycleGAN/data/He/He_val.pklv4
+    n_max: 100
+    heats: [0.0, 0.5, 0.75, 1.0]
+    n_sample: 4 
+
+network_G:
+  which_model_G: SRFlowNet3D  # Use 3D version
+  in_nc: 1  # Single channel input
+  out_nc: 1  # Single channel output
+  nf: 64
+  nb: 23
+  upscale: 1
+  train_RRDB: false
+  train_RRDB_delay: 0.5
+  scale: 1
+  isotropic3d: true  # Using 3D convolutions
+  
+  flow:
+    K: 16  # Number of flow steps
+    L: 2   # Reduced number of levels to prevent excessive recursion
+    noInitialInj: true
+    flow_coupling: CondAffineSeparatedAndCond  # Using supported coupling type
+    additionalFlowNoAffine: 2
+    flow_permutation: invconv  # Use invertible 1x1 convs
+    LU_decomposed: false
+    hidden_channels: 64
+    actnorm_scale: 1.0
+    patch_size: 248  # Spatial size
+    split:
+      enable: true  # Enable splitting to handle large channel dimension
+      sections: [120, 120]  # Split into manageable chunks
+    fea_up0: true
+    stackRRDB:
+      enable: true
+      blocks: [0,1,2]
+      concat: true
+    max_depth: 50  # Add explicit max recursion depth
+
+train:
+  manual_seed: 10
+  lr_G: !!float 5e-5  # Lower learning rate
+  weight_decay_G: 1e-5  # Add weight decay
+  beta1_G: 0.9
+  beta2_G: 0.99
+  lr_scheme: MultiStepLR
+
+  niter: 200000
+  warmup_iter: 1000  # Add warmup
+  lr_steps: [50000, 100000, 150000, 200000]
+  lr_gamma: 0.5
+
+  pixel_criterion: l1
+  pixel_weight: 1.0
+  val_freq: !!float 5e3
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+
+path:
+  root: D:/Daniel/SRFlowCycleGAN
+  pretrain_model_G: ~
+  strict_load: true
+  resume_state: ~
