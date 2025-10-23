@@ -74,10 +74,32 @@ def define_G(opt):
 def define_Flow(opt, step):
     opt_net = opt['network_G']
     which_model = opt_net['which_model_G']
+    use_iso3d = opt_net.get('isotropic3d', False)
 
-    Arch = find_model_using_name(which_model)
-    netG = Arch(in_nc=opt_net['in_nc'], out_nc=opt_net['out_nc'],
-                nf=opt_net['nf'], nb=opt_net['nb'], scale=opt['scale'], K=opt_net['flow']['K'], opt=opt, step=step)
+    if use_iso3d:
+        # Use 3D version for volumetric data
+        import models.modules.SRFlowNet3D_arch as SRFlowNet3D_arch
+        netG = SRFlowNet3D_arch.SRFlowNet3D(
+            in_nc=opt_net['in_nc'], 
+            out_nc=opt_net['out_nc'],
+            nf=opt_net['nf'], 
+            nb=opt_net['nb'], 
+            scale=opt['scale'], 
+            K=opt_net['flow']['K'], 
+            opt=opt, 
+            step=step)
+    else:
+        # Standard 2D version
+        Arch = find_model_using_name(which_model)
+        netG = Arch(
+            in_nc=opt_net['in_nc'], 
+            out_nc=opt_net['out_nc'],
+            nf=opt_net['nf'], 
+            nb=opt_net['nb'], 
+            scale=opt['scale'], 
+            K=opt_net['flow']['K'], 
+            opt=opt, 
+            step=step)
 
     return netG
 

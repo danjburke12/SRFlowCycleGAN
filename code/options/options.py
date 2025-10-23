@@ -33,11 +33,26 @@ def parse(opt_path, is_train=True):
     opt['is_train'] = is_train
     if opt['distortion'] == 'sr':
         scale = opt['scale']
+        
+    # Move validation parameters from root 'val' section to datasets.val if needed
+    if 'val' in opt and isinstance(opt['val'], dict):
+        if 'heats' in opt['val'] or 'n_sample' in opt['val']:
+            if 'datasets' not in opt:
+                opt['datasets'] = {}
+            if 'val' not in opt['datasets']:
+                opt['datasets']['val'] = {}
+            # Transfer validation parameters
+            if 'heats' in opt['val']:
+                opt['datasets']['val']['heats'] = opt['val']['heats']
+            if 'n_sample' in opt['val']:
+                opt['datasets']['val']['n_sample'] = opt['val']['n_sample']
 
     # datasets
     for phase, dataset in opt['datasets'].items():
-        phase = phase.split('_')[0]
-        dataset['phase'] = phase
+        if not isinstance(dataset, dict):
+            continue  # Skip non-dictionary values (e.g., indices lists)
+        phase_name = phase.split('_')[0]
+        dataset['phase'] = phase_name
         if opt['distortion'] == 'sr':
             dataset['scale'] = scale
         is_lmdb = False
@@ -50,7 +65,7 @@ def parse(opt_path, is_train=True):
             if dataset['dataroot_LQ'].endswith('lmdb'):
                 is_lmdb = True
         dataset['data_type'] = 'lmdb' if is_lmdb else 'img'
-        if dataset['mode'].endswith('mc'):  # for memcached
+        if dataset.get('mode', '').endswith('mc'):  # for memcached
             dataset['data_type'] = 'mc'
             dataset['mode'] = dataset['mode'].replace('_mc', '')
 

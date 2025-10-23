@@ -52,12 +52,21 @@ def mean(tensor, dim=None, keepdim=False):
 def split_feature(tensor, type="split"):
     """
     type = ["split", "cross"]
+    Handles both 4D (B,C,H,W) and 5D (B,C,D,H,W) tensors
     """
     C = tensor.size(1)
+    if C == 1:  # Special case for single channel
+        if type == "split":
+            return tensor, torch.zeros_like(tensor)
+        else:  # cross
+            return tensor, torch.zeros_like(tensor)
+    
     if type == "split":
         return tensor[:, :C // 2, ...], tensor[:, C // 2:, ...]
     elif type == "cross":
         return tensor[:, 0::2, ...], tensor[:, 1::2, ...]
+    else:
+        raise ValueError(f"Unknown split type: {type}")
 
 
 def cat_feature(tensor_a, tensor_b):

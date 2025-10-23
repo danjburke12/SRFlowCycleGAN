@@ -141,30 +141,58 @@ class GaussianDiag:
 
 
 def squeeze3d(x, factor=2):
-    """Squeeze 3D: (B,C,D,H,W)->(B,C*factor^3,D/f,H/f,W/f)."""
+    """Squeeze 3D: Increase channels while preserving volume.
+    This version expects 5D input tensor (B,C,D,H,W) and squeezes spatial dimensions only.
+    Output shape: (B,C*factor^2,D,H/f,W/f)
+    """
     assert factor >= 1 and isinstance(factor, int)
     if factor == 1:
         return x
+        
+    if len(x.shape) != 5:
+        raise ValueError(f"Expected 5D input tensor (B,C,D,H,W), got shape {x.shape}")
+        
     B, C, D, H, W = x.size()
-    assert D % factor == 0 and H % factor == 0 and W % factor == 0, (D, H, W, factor)
-    x = x.view(B, C, D // factor, factor, H // factor, factor, W // factor, factor)
-    x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-    x = x.view(B, C * factor ** 3, D // factor, H // factor, W // factor)
+    assert H % factor == 0 and W % factor == 0, f"Height {H} and width {W} must be divisible by factor {factor}"
+    
+    # Reshape height and width only, leave depth dimension unchanged
+    x = x.view(B, C, D, H // factor, factor, W // factor, factor)
+    
+    # Move factor dimensions next to channels
+    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
+    
+    # Merge factors into channels
+    x = x.view(B, C * (factor ** 2), D, H // factor, W // factor)
+    
     return x
 
 
 def unsqueeze3d(x, factor=2):
-    """Inverse of squeeze3d."""
+    """Inverse of squeeze3d operation.
+    Input shape: (B,C*factor^2,D,H/f,W/f)
+    Output shape: (B,C,D,H,W)
+    """
     assert factor >= 1 and isinstance(factor, int)
     if factor == 1:
         return x
+        
+    if len(x.shape) != 5:
+        raise ValueError(f"Expected 5D input tensor (B,C,D,H,W), got shape {x.shape}")
+        
     B, C, D, H, W = x.size()
-    factor3 = factor ** 3
-    assert C % factor3 == 0, (C, factor)
-    C_out = C // factor3
-    x = x.view(B, C_out, factor, factor, factor, D, H, W)
-    x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-    x = x.view(B, C_out, D * factor, H * factor, W * factor)
+    factor2 = factor ** 2
+    assert C % factor2 == 0, f"Channel dimension {C} must be divisible by factor^2 {factor2}"
+    C_out = C // factor2
+    
+    # Split channels into original channels and factors
+    x = x.view(B, C_out, factor, factor, D, H, W)
+    
+    # Rearrange to restore original shape
+    x = x.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
+    
+    # Merge factor dimensions back into spatial dimensions
+    x = x.view(B, C_out, D, H * factor, W * factor)
+    
     return x
 
 

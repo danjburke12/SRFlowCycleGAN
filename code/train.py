@@ -21,18 +21,25 @@ import argparse
 import random
 import logging
 import cv2
+import sys
+
+# Set higher recursion limit
+sys.setrecursionlimit(10000)
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
+import os
 import options.options as option
 from utils import util
 from data import create_dataloader, create_dataset
+import sys
+from data.PairedVolumeDataset3D import PairedVolumeDataset3D
 from models import create_model
 from utils.timer import Timer, TickTock
 from utils.util import get_resume_paths
 
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 def getEnv(name): import os; return True if name in os.environ.keys() else False
 
@@ -135,28 +142,77 @@ def main():
 
     #### create train and val dataloader
     dataset_ratio = 200  # enlarge the size of each epoch
+    train_loader = None 
+    val_loader = None
     for phase, dataset_opt in opt['datasets'].items():
+        if not isinstance(dataset_opt, dict):
+            continue  # Skip non-dictionary values (e.g., indices lists)
         if phase == 'train':
-            train_set = create_dataset(dataset_opt)
-            print('Dataset created')
-            train_size = int(math.ceil(len(train_set) / dataset_opt['batch_size']))
-            total_iters = int(opt['train']['niter'])
-            total_epochs = int(math.ceil(total_iters / train_size))
-            train_sampler = None
-            train_loader = create_dataloader(train_set, dataset_opt, opt, train_sampler)
-            if rank <= 0:
-                logger.info('Number of train images: {:,d}, iters: {:,d}'.format(
-                    len(train_set), train_size))
-                logger.info('Total epochs needed: {:d} for iters {:,d}'.format(
-                    total_epochs, total_iters))
+            if dataset_opt.get('mode', '') == 'PatchVolume3D':
+                from PatchVolumeDataset3D import PatchVolumeDataset3D
+                indices = dataset_opt['indices']
+                train_set = PatchVolumeDataset3D(
+                    he_dir=dataset_opt['he_dir'],
+                    hp_dir=dataset_opt['hp_dir'],
+                    indices=indices,
+                    depth=dataset_opt['depth'],
+                    height=dataset_opt['height'],
+                    width=dataset_opt['width'],
+                    patch_size=dataset_opt['patch_size']
+                )
+                print('PatchVolumeDataset3D created')
+                train_size = int(math.ceil(len(train_set) / dataset_opt['batch_size']))
+                total_iters = int(opt['train']['niter'])
+                total_epochs = int(math.ceil(total_iters / train_size))
+                train_sampler = None
+                train_loader = create_dataloader(train_set, dataset_opt, opt, train_sampler)
+                if rank <= 0:
+                    logger.info('Number of train patches: {:,d}, iters: {:,d}'.format(
+                        len(train_set), train_size))
+                    logger.info('Total epochs needed: {:d} for iters {:,d}'.format(
+                        total_epochs, total_iters))
+            else:
+                # Fallback to original dataset loader for train
+                train_set = create_dataset(dataset_opt)
+                print('Dataset created')
+                train_size = int(math.ceil(len(train_set) / dataset_opt['batch_size']))
+                total_iters = int(opt['train']['niter'])
+                total_epochs = int(math.ceil(total_iters / train_size))
+                train_sampler = None
+                train_loader = create_dataloader(train_set, dataset_opt, opt, train_sampler)
+                if rank <= 0:
+                    logger.info('Number of train images: {:,d}, iters: {:,d}'.format(
+                        len(train_set), train_size))
+                    logger.info('Total epochs needed: {:d} for iters {:,d}'.format(
+                        total_epochs, total_iters))
         elif phase == 'val':
-            val_set = create_dataset(dataset_opt)
-            val_loader = create_dataloader(val_set, dataset_opt, opt, None)
-            if rank <= 0:
-                logger.info('Number of val images in [{:s}]: {:d}'.format(
-                    dataset_opt['name'], len(val_set)))
-        else:
-            raise NotImplementedError('Phase [{:s}] is not recognized.'.format(phase))
+            if dataset_opt.get('mode', '') == 'PatchVolume3D':
+                from PatchVolumeDataset3D import PatchVolumeDataset3D
+                val_set = PatchVolumeDataset3D(
+                    he_dir=dataset_opt['he_dir'],
+                    hp_dir=dataset_opt['hp_dir'],
+                    indices=dataset_opt['indices'],
+                    depth=dataset_opt['depth'],
+                    height=dataset_opt['height'],
+                    width=dataset_opt['width'],
+                    patch_size=dataset_opt['patch_size']
+                )
+                val_loader = create_dataloader(val_set, dataset_opt, opt, None)
+                if rank <= 0:
+                    logger.info('Number of val patches in [{:s}]: {:d}'.format(
+                        dataset_opt['name'], len(val_set)))
+            else:
+                # Fallback to original dataset loader for val
+                val_set = create_dataset(dataset_opt)
+                val_loader = create_dataloader(val_set, dataset_opt, opt, None)
+                if rank <= 0:
+                    logger.info('Number of val images in [{:s}]: {:d}'.format(
+                        dataset_opt['name'], len(val_set)))
+
+    if train_loader is None:
+        raise ValueError('No training data loader was created')
+    if val_loader is None:
+        raise ValueError('No validation data loader was created')
     assert train_loader is not None
 
     #### create model
@@ -194,13 +250,14 @@ def main():
             #### training
             model.feed_data(train_data)
 
-            #### update learning rate
-            model.update_learning_rate(current_step, warmup_iter=opt['train']['warmup_iter'])
-
+            nll = 0
             try:
                 nll = model.optimize_parameters(current_step)
+                
+                # Update learning rate after optimizer step
+                model.update_learning_rate(current_step, warmup_iter=opt['train']['warmup_iter'])
             except RuntimeError as e:
-                print("Skipping ERROR caught in nll = model.optimize_parameters(current_step): ")
+                print("Skipping ERROR caught in model.optimize_parameters(current_step): ")
                 print(e)
 
             if nll is None:
@@ -230,13 +287,13 @@ def main():
                     tb_logger_train.add_scalar(k, v, current_step)
 
             # validation
-            if current_step % opt['logger']['val_freq'] == 0 and rank <= 0:
+            if current_step % opt['train']['val_freq'] == 0 and rank <= 0:
                 avg_psnr = 0.0
                 idx = 0
                 nlls = []
                 for val_data in val_loader:
                     idx += 1
-                    img_name = os.path.splitext(os.path.basename(val_data['LQ_path'][0]))[0]
+                    img_name = f"val_sample_{idx}"  # Use index as image name
                     img_dir = os.path.join(opt['path']['val_images'], img_name)
                     util.mkdir(img_dir)
 
@@ -328,3 +385,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# Training command:
+# python code/train.py -opt code/confs/SRFlow_He_to_Hp_volume_v9.yml

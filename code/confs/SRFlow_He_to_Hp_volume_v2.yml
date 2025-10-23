@@ -1,0 +1,79 @@
+name: SRFlow_He_to_Hp
+model: SRFlow
+distortion: volume  # Type of conversion we're doing
+scale: 1  # No upscaling for volume-to-volume conversion
+gpu_ids: [0]
+
+datasets:
+  train:
+    name: He_to_Hp_train
+    mode: LRHR_PKL  # Use default mode, our datatype setting will override
+    dataroot_GT: D:\Daniel\SRFlowCycleGAN\data\He\He_train.pklv4  # path to He training data
+    dataroot_LQ: D:\Daniel\SRFlowCycleGAN\data\Hp\Hp_train.pklv4  # path to H+ training data
+    batch_size: 8  # Set batch size here too
+    use_flip: true  # use horizontal flip augmentation
+    use_rot: true  # use rotation augmentation
+    patch_size: 64  # size of 3D patches for training
+    datatype: volume  # use our custom volume dataset
+    data_len: -1  # use all data
+    n_workers: 0
+
+  val:
+    name: He_to_Hp_val
+    mode: LRHR_PKL  # Use default mode, our datatype setting will override
+    dataroot_GT: D:\Daniel\SRFlowCycleGAN\data\He\He_val.pklv4  # path to validation He data
+    dataroot_LQ: D:\Daniel\SRFlowCycleGAN\data\Hp\Hp_val.pklv4  # path to validation H+ data
+    batch_size: 1  # Single batch for validation
+    patch_size: 64
+    datatype: volume
+    n_max: 10  # Number of validation pairs to use
+
+val:
+  heats: [0.0, 0.5, 0.7, 0.9]  # Temperature values for sampling during validation
+  n_sample: 4  # Number of samples to generate per temperature
+
+path:
+  root: D:\Daniel\SRFlowCycleGAN
+  pretrain_model_G: ~  # No pretrained model
+
+network_G:
+  which_model_G: SRFlowNet  # Specify the model architecture
+  in_nc: 1  # Single channel input (volumetric scalar field)
+  out_nc: 1  # Single channel output
+  nf: 64  # Number of filters
+  nb: 23  # Number of blocks
+  train_RRDB: true
+  train_RRDB_delay: 0.5  # Start training RRDB after 0.5 of total iterations
+  isotropic3d: true  # Enable 3D mode
+  flow:  # Flow model configuration
+    K: 16  # Number of flow steps
+    L: 3   # Number of levels
+    coupling: CondAffineSeparatedAndCond  # Conditional affine coupling
+    conditional: true  # Enable conditioning
+    subnet_constructor: ResBlock  # Residual blocks for coupling transforms
+    split:
+      enable: true  # Enable splitting for better memory efficiency
+    condition_key: LR  # Low-resolution input is the condition
+    hidden_channels: 64  # Number of flow hidden channels
+
+train:  # Training settings
+  lr_G: !!float 2e-4  # Initial learning rate
+  beta1: 0.9  # Adam beta1
+  beta2: 0.99  # Adam beta2
+  niter: 500000  # Number of training iterations
+  warmup_iter: -1  # No warmup
+  batch_size: 8
+  val_freq: 5000  # How often to run validation
+  lr_scheme: MultiStepLR  # Learning rate scheduler
+  lr_steps: [200000, 400000]  # Steps where learning rate will decay
+  lr_gamma: 0.5  # Multiplicative factor of learning rate decay
+  manual_seed: 10  # Random seed
+  pixel_criterion: l1  # Loss criterion for pixels
+  pixel_weight: !!float 1  # Weight for pixel loss
+  lambda_fit: 1.0  # Weight for reconstruction loss
+
+logger:
+  print_freq: 100  # How often to print training stats
+  save_checkpoint_freq: !!float 5e3  # How often to save checkpoints
+  visual_samples: 4  # Number of samples to visualize during validation
+  visual_freq: !!float 5e3  # How often to save visualizations

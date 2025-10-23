@@ -67,9 +67,8 @@ class BaseModel():
         return init_lr_groups_l
 
     def update_learning_rate(self, cur_iter, warmup_iter=-1):
-        for scheduler in self.schedulers:
-            scheduler.step()
-        #### set up warm up learning rate
+        # Move scheduler.step() to after optimizer step
+        # Set up warm up learning rate only
         if cur_iter < warmup_iter:
             # get initial lr for each group
             init_lr_g_l = self._get_init_lr()
