@@ -158,7 +158,9 @@ def main():
                     depth=dataset_opt['depth'],
                     height=dataset_opt['height'],
                     width=dataset_opt['width'],
-                    patch_size=dataset_opt['patch_size']
+                    crop_size=dataset_opt.get('patch_size', [16, 16, 16]),
+                    croptimes=dataset_opt.get('croptimes', 1),
+                    normalize=dataset_opt.get('normalize', True)
                 )
                 print('PatchVolumeDataset3D created')
                 train_size = int(math.ceil(len(train_set) / dataset_opt['batch_size']))
@@ -195,7 +197,9 @@ def main():
                     depth=dataset_opt['depth'],
                     height=dataset_opt['height'],
                     width=dataset_opt['width'],
-                    patch_size=dataset_opt['patch_size']
+                    crop_size=dataset_opt.get('patch_size', [16, 16, 16]),
+                    croptimes=dataset_opt.get('croptimes', 1),
+                    normalize=dataset_opt.get('normalize', True)
                 )
                 val_loader = create_dataloader(val_set, dataset_opt, opt, None)
                 if rank <= 0:

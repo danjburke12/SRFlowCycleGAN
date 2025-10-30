@@ -32,8 +32,8 @@ network_G:
   which_model_G: SRFlowNet3D  # Use 3D version
   in_nc: 1  # Single channel input
   out_nc: 1  # Single channel output
-  nf: 64
-  nb: 23
+  nf: 32
+  nb: 11
   upscale: 1
   train_RRDB: false
   train_RRDB_delay: 0.5
@@ -49,7 +49,7 @@ network_G:
     LU_decomposed: false
     hidden_channels: 64
     actnorm_scale: 1.0
-    patch_size: 128  # Spatial size
+    patch_size: [8, 8, 8]  # Used for l, w, h (16 x 16 x 16)
     split:
       enable: true  # Enable splitting to handle large channel dimension
       sections: [120, 120]  # Split into manageable chunks

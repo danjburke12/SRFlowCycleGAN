@@ -85,82 +85,44 @@ class SRFlowBidirectionalModel(SRFlowModel):
                 tensor = tensor.squeeze(2)  # Convert to [1, 1, D, H, W]
                 
     def optimize_parameters(self, step):
-        """Optimize networks with all losses."""
+        """Optimize networks with losses for one direction per iteration to reduce memory usage."""
         self.netG_Y.train()
         self.netG_X.train()
-        
+
         losses = {}
-        
+
         # Get loss weights from options
-        weight_nll = opt_get(self.opt, ['train', 'weight_fl'], 1.0)      # NLL weight
-        weight_cycle = opt_get(self.opt, ['train', 'weight_cycle'], 10.0) # Cycle consistency
-        weight_pair = opt_get(self.opt, ['train', 'weight_pair'], 5.0)    # Paired supervision 
-        weight_align = opt_get(self.opt, ['train', 'weight_align'], 1.0)  # Latent alignment
-        
-        # 1. Negative Log-Likelihood Loss (per domain)
-        if weight_nll > 0:
+        weight_nll = opt_get(self.opt, ['train', 'weight_fl'], 1.0)
+        weight_pair = opt_get(self.opt, ['train', 'weight_pair'], 5.0)
+
+        # Alternate directions: even step = He->H+, odd step = H+->He
+        if step % 2 == 0:
             # He -> H+ direction
             z_y, nll_y, _ = self.netG_Y(gt=self.var_Hp, lr=self.var_He, reverse=False)
-            nll_loss_y = torch.mean(nll_y)
-            
-            # H+ -> He direction  
+            if weight_nll > 0:
+                losses['nll_loss'] = torch.mean(nll_y) * weight_nll
+            if weight_pair > 0:
+                hp_direct = self.netG_Y(lr=self.var_He, z=None, eps_std=0, reverse=True)[0]
+                pair_loss = (hp_direct - self.var_Hp).abs().mean()
+                losses['pair_loss'] = pair_loss * weight_pair
+            total_loss = sum(losses.values())
+            self.optimizer_G_Y.zero_grad()
+            total_loss.backward()
+            self.optimizer_G_Y.step()
+        else:
+            # H+ -> He direction
             z_x, nll_x, _ = self.netG_X(gt=self.var_He, lr=self.var_Hp, reverse=False)
-            nll_loss_x = torch.mean(nll_x)
-            
-            losses['nll_loss'] = (nll_loss_y + nll_loss_x) * weight_nll
-            
-        # 2. Cycle Consistency Loss
-        if weight_cycle > 0:
-            # He -> H+ -> He
-            z1 = self.get_z(heat=0, seed=None, batch_size=self.var_He.shape[0], lr_shape=self.var_He.shape)
-            hp_gen, _ = self.netG_Y(lr=self.var_He, z=z1, eps_std=0, reverse=True)
-            z2 = self.get_z(heat=0, seed=None, batch_size=self.var_He.shape[0], lr_shape=self.var_He.shape) 
-            he_cyc, _ = self.netG_X(lr=hp_gen, z=z2, eps_std=0, reverse=True)
-            
-            # H+ -> He -> H+
-            z3 = self.get_z(heat=0, seed=None, batch_size=self.var_Hp.shape[0], lr_shape=self.var_Hp.shape)
-            he_gen, _ = self.netG_X(lr=self.var_Hp, z=z3, eps_std=0, reverse=True)
-            z4 = self.get_z(heat=0, seed=None, batch_size=self.var_Hp.shape[0], lr_shape=self.var_Hp.shape)
-            hp_cyc, _ = self.netG_Y(lr=he_gen, z=z4, eps_std=0, reverse=True)
-            
-            cycle_loss = (he_cyc - self.var_He).abs().mean() + (hp_cyc - self.var_Hp).abs().mean()
-            losses['cycle_loss'] = cycle_loss * weight_cycle
-            
-        # 3. Supervised Cross-Domain Loss (paired data)
-        if weight_pair > 0:
-            # He -> H+ direct mapping
-            z5 = self.get_z(heat=0, seed=None, batch_size=self.var_He.shape[0], lr_shape=self.var_He.shape)
-            hp_direct, _ = self.netG_Y(lr=self.var_He, z=z5, eps_std=0, reverse=True)
-            
-            # H+ -> He direct mapping
-            z6 = self.get_z(heat=0, seed=None, batch_size=self.var_Hp.shape[0], lr_shape=self.var_Hp.shape)
-            he_direct, _ = self.netG_X(lr=self.var_Hp, z=z6, eps_std=0, reverse=True)
-            
-            pair_loss = (hp_direct - self.var_Hp).abs().mean() + (he_direct - self.var_He).abs().mean()
-            losses['pair_loss'] = pair_loss * weight_pair
-            
-        # 4. Latent Space Alignment Loss
-        if weight_align > 0:
-            # Get latent codes for matched pairs
-            z_he, _, _ = self.netG_X(gt=self.var_He, lr=self.var_Hp, reverse=False)
-            z_hp, _, _ = self.netG_Y(gt=self.var_Hp, lr=self.var_He, reverse=False)
-            
-            # MSE between matched latent codes
-            align_loss = (z_he - z_hp).pow(2).mean()
-            losses['align_loss'] = align_loss * weight_align
-            
-        # Combined loss
-        total_loss = sum(losses.values())
-        
-        # Update both networks
-        self.optimizer_G_Y.zero_grad()
-        self.optimizer_G_X.zero_grad()
-        total_loss.backward()
-        self.optimizer_G_Y.step()
-        self.optimizer_G_X.step()
-        
+            if weight_nll > 0:
+                losses['nll_loss'] = torch.mean(nll_x) * weight_nll
+            if weight_pair > 0:
+                he_direct = self.netG_X(lr=self.var_Hp, z=None, eps_std=0, reverse=True)[0]
+                pair_loss = (he_direct - self.var_He).abs().mean()
+                losses['pair_loss'] = pair_loss * weight_pair
+            total_loss = sum(losses.values())
+            self.optimizer_G_X.zero_grad()
+            total_loss.backward()
+            self.optimizer_G_X.step()
         self.log_dict = losses
-        
         return total_loss.item()
         
     def test(self):
