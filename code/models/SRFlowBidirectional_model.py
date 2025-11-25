@@ -13,76 +13,102 @@
 # limitations under the License.
 
 import logging
+import models.networks as networks
+from torch.nn.parallel import DataParallel, DistributedDataParallel
 from collections import OrderedDict
 import torch
 import torch.nn as nn
+from .SRFlow_model import SRFlowModel
+from utils.util import opt_get
 from .SRFlow_model import SRFlowModel
 from utils.util import opt_get
 
 logger = logging.getLogger('base')
 
 class SRFlowBidirectionalModel(SRFlowModel):
+    def get_z(self, heat, seed=None, batch_size=1, lr_shape=None):
+        # If parent has get_z, use it
+        if hasattr(super(), 'get_z'):
+            return super().get_z(heat, seed=seed, batch_size=batch_size, lr_shape=lr_shape)
+        # Otherwise, use standard implementation
+        if seed is not None:
+            torch.manual_seed(seed)
+        shape = lr_shape
+        if isinstance(shape, torch.Size):
+            shape = tuple(shape)
+        z = torch.randn(shape, device=self.device) * heat
+        return z
     """Bidirectional SRFlow model for mapping between two domains X and Y."""
     
     def __init__(self, opt, step):
         super().__init__(opt, step)
         self.opt = opt
-        
+
+        # memory saving: max number of temporal frames to keep in memory per sample
+        self.max_depth_frames = int(opt.get('max_depth_frames', 64))
+
         # Initialize second flow network for the other direction
-        self.netG_Y = self.netG  # Rename first network for clarity
+        self.netG_Y = self.netG.to(self.device)  # Ensure on correct device
         self.netG_X = networks.define_Flow(opt, step).to(self.device)  # Create second network
-        
-        if opt['dist']:
+
+        if opt.get('dist', False):
+            self.netG_Y = DistributedDataParallel(self.netG_Y, device_ids=[torch.cuda.current_device()])
             self.netG_X = DistributedDataParallel(self.netG_X, device_ids=[torch.cuda.current_device()])
         else:
+            self.netG_Y = DataParallel(self.netG_Y)
             self.netG_X = DataParallel(self.netG_X)
-            
+
         # Initialize optimizers for both networks
         self.init_optimizers(opt['train'])
         
     def init_optimizers(self, train_opt):
         """Initialize optimizers for both networks."""
         self.optimizers = []
-        wd_G = train_opt['weight_decay_G'] if train_opt['weight_decay_G'] else 0
-        
+        wd_G = float(train_opt.get('weight_decay_G', 0))
+        beta1 = train_opt.get('beta1_G', train_opt.get('beta1', 0.9))
+        beta2 = train_opt.get('beta2_G', train_opt.get('beta2', 0.99))
+
         # Optimizer for G_Y (He -> H+)
-        optim_params_Y = []
-        for k, v in self.netG_Y.named_parameters():
-            if v.requires_grad:
-                optim_params_Y.append(v)
-                
-        # Optimizer for G_X (H+ -> He) 
-        optim_params_X = []
-        for k, v in self.netG_X.named_parameters():
-            if v.requires_grad:
-                optim_params_X.append(v)
-                
-        # Create optimizers
+        optim_params_Y = [v for k, v in self.netG_Y.named_parameters() if v.requires_grad]
+        # Optimizer for G_X (H+ -> He)
+        optim_params_X = [v for k, v in self.netG_X.named_parameters() if v.requires_grad]
+
         self.optimizer_G_Y = torch.optim.Adam(
             optim_params_Y,
-            lr=train_opt['lr_G'],
-            betas=(train_opt['beta1'], train_opt['beta2']),
+            lr=train_opt.get('lr_G', 5e-5),
+            betas=(beta1, beta2),
             weight_decay=wd_G
         )
-        
+        for param_group in self.optimizer_G_Y.param_groups:
+            param_group['initial_lr'] = param_group['lr']
+
         self.optimizer_G_X = torch.optim.Adam(
             optim_params_X,
-            lr=train_opt['lr_G'],
-            betas=(train_opt['beta1'], train_opt['beta2']),
+            lr=train_opt.get('lr_G', 5e-5),
+            betas=(beta1, beta2),
             weight_decay=wd_G
         )
-        
+        for param_group in self.optimizer_G_X.param_groups:
+            param_group['initial_lr'] = param_group['lr']
+
         self.optimizers.extend([self.optimizer_G_Y, self.optimizer_G_X])
         
     def feed_data(self, data):
-        """Feed both He and H+ data."""
-        self.var_He = data['He'].to(self.device)  # He input
-        self.var_Hp = data['H+'].to(self.device)  # H+ input
-        
-        # Handle dimensionality
-        for tensor in [self.var_He, self.var_Hp]:
-            if tensor.dim() == 6:  # If shape is [1, 1, 1, D, H, W]
-                tensor = tensor.squeeze(2)  # Convert to [1, 1, D, H, W]
+        """Feed both He and H+ data. Accepts flexible keys."""
+        he_key = 'He' if 'He' in data else 'LQ' if 'LQ' in data else list(data.keys())[0]
+        hp_key = 'H+' if 'H+' in data else 'GT' if 'GT' in data else list(data.keys())[1]
+        self.var_He = data[he_key].to(self.device)
+        self.var_Hp = data[hp_key].to(self.device)
+        # Fix shape for Conv3d: squeeze 3rd dim if present
+        if self.var_He.dim() == 6:
+            self.var_He = self.var_He.squeeze(2)
+        if self.var_Hp.dim() == 6:
+            self.var_Hp = self.var_Hp.squeeze(2)
+        # Crop temporal depth if sequences are too long (memory saving)
+        if self.var_He.shape[2] > self.max_depth_frames:
+            self.var_He = self.var_He[:, :, :self.max_depth_frames, ...]
+        if self.var_Hp.shape[2] > self.max_depth_frames:
+            self.var_Hp = self.var_Hp[:, :, :self.max_depth_frames, ...]
                 
     def optimize_parameters(self, step):
         """Optimize networks with losses for one direction per iteration to reduce memory usage."""
@@ -95,35 +121,50 @@ class SRFlowBidirectionalModel(SRFlowModel):
         weight_nll = opt_get(self.opt, ['train', 'weight_fl'], 1.0)
         weight_pair = opt_get(self.opt, ['train', 'weight_pair'], 5.0)
 
+        total_loss = torch.tensor(0.0, device=self.device)
         # Alternate directions: even step = He->H+, odd step = H+->He
         if step % 2 == 0:
             # He -> H+ direction
             z_y, nll_y, _ = self.netG_Y(gt=self.var_Hp, lr=self.var_He, reverse=False)
             if weight_nll > 0:
                 losses['nll_loss'] = torch.mean(nll_y) * weight_nll
-            if weight_pair > 0:
-                hp_direct = self.netG_Y(lr=self.var_He, z=None, eps_std=0, reverse=True)[0]
-                pair_loss = (hp_direct - self.var_Hp).abs().mean()
-                losses['pair_loss'] = pair_loss * weight_pair
-            total_loss = sum(losses.values())
-            self.optimizer_G_Y.zero_grad()
-            total_loss.backward()
-            self.optimizer_G_Y.step()
-        else:
-            # H+ -> He direction
-            z_x, nll_x, _ = self.netG_X(gt=self.var_He, lr=self.var_Hp, reverse=False)
-            if weight_nll > 0:
-                losses['nll_loss'] = torch.mean(nll_x) * weight_nll
-            if weight_pair > 0:
-                he_direct = self.netG_X(lr=self.var_Hp, z=None, eps_std=0, reverse=True)[0]
-                pair_loss = (he_direct - self.var_He).abs().mean()
-                losses['pair_loss'] = pair_loss * weight_pair
-            total_loss = sum(losses.values())
-            self.optimizer_G_X.zero_grad()
-            total_loss.backward()
-            self.optimizer_G_X.step()
+            # if weight_pair > 0:
+            #     hp_direct = self.netG_Y(lr=self.var_He, z=None, eps_std=0, reverse=True)[0]
+            #     pair_loss = (hp_direct - self.var_Hp).abs().mean()
+            #     losses['pair_loss'] = pair_loss * weight_pair
+            if losses:
+                total_loss = sum(losses.values())
+                self.optimizer_G_Y.zero_grad()
+                total_loss.backward()
+                self.optimizer_G_Y.step()
+                # free any cached GPU memory after optimizer step
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        # else:
+        #     # H+ -> He direction
+        #     z_x, nll_x, _ = self.netG_X(gt=self.var_He, lr=self.var_Hp, reverse=False)
+        #     if weight_nll > 0:
+        #         losses['nll_loss'] = torch.mean(nll_x) * weight_nll
+        #     if weight_pair > 0:
+        #         he_direct = self.netG_X(lr=self.var_Hp, z=None, eps_std=0, reverse=True)[0]
+        #         pair_loss = (he_direct - self.var_He).abs().mean()
+        #         losses['pair_loss'] = pair_loss * weight_pair
+    #     if losses:
+    #         total_loss = sum(losses.values())
+    #         self.optimizer_G_X.zero_grad()
+    #         total_loss.backward()
+    #         self.optimizer_G_X.step()
+    #         # free any cached GPU memory after optimizer step
+    #         try:
+    #             if torch.cuda.is_available():
+    #                 torch.cuda.empty_cache()
+    #         except Exception:
+    #             pass
         self.log_dict = losses
-        return total_loss.item()
+        return total_loss.item() if losses else 0.0
         
     def test(self):
         self.netG_Y.eval()

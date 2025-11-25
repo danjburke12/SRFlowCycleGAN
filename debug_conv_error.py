@@ -44,10 +44,12 @@ def debug_forward_pass():
     
     # Create model
     from models.SR_model import SRModel
-    from models.SRFlow_model import SRFlowModel
+    from models.SRFlowBidirectional_model import SRFlowBidirectionalModel
     
-    if opt['model'] == 'SRFlow':
-        model = SRFlowModel(opt, step=0)
+    if opt['model'] == 'SRFlowBidirectional':
+        model = SRFlowBidirectionalModel(opt, step=0)
+    else:
+        model = SRModel(opt)
     else:
         model = SRModel(opt)
     

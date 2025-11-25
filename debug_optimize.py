@@ -6,7 +6,7 @@ sys.path.append('code')
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-from models.SRFlow_model import SRFlowModel
+from models.SRFlowBidirectional_model import SRFlowBidirectionalModel
 import yaml
 
 # Use CPU
@@ -50,7 +50,7 @@ def debug_optimize_parameters():
             opt['train'][key] = value
     
     # Create model  
-    model = SRFlowModel(opt, 0)
+    model = SRFlowBidirectionalModel(opt, 0)
     
     # Create 5D test tensors: batch x channels x depth x height x width
     lr_tensor = torch.randn(1, 1, 32, 32, 32).to(device)

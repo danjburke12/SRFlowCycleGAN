@@ -3,7 +3,8 @@ use_tb_logger: true
 distortion: sr
 scale: 1
 gpu_ids: [0]
-model: SRFlow
+model: SRFlowBidirectional
+max_depth_frames: 32  # Crop sequences to 32 frames to save memory
 
 datasets:
   train:
@@ -32,8 +33,8 @@ network_G:
   which_model_G: SRFlowNet3D  # Use 3D version
   in_nc: 1  # Single channel input
   out_nc: 1  # Single channel output
-  nf: 32
-  nb: 11
+  nf: 16  # Reduced from 32 to save memory
+  nb: 6   # Reduced from 11 to save memory
   upscale: 1
   train_RRDB: false
   train_RRDB_delay: 0.5
